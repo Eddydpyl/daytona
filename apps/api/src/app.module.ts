@@ -33,9 +33,29 @@ import { AuditModule } from './audit/audit.module'
 import { HealthModule } from './health/health.module'
 import { OpenFeatureModule } from '@openfeature/nestjs-sdk'
 import { OpenFeaturePostHogProvider } from './common/providers/openfeature-posthog.provider'
+import { LoggerModule } from 'nestjs-pino'
+import { getPinoTransport, swapMessageAndObject } from './common/utils/pino.util'
 
 @Module({
   imports: [
+    LoggerModule.forRootAsync({
+      useFactory: (configService: TypedConfigService) => {
+        const logConfig = configService.get('log')
+        const isProduction = configService.get('production')
+        return {
+          pinoHttp: {
+            autoLogging: logConfig.requests.enabled,
+            level: logConfig.level,
+            hooks: {
+              logMethod: swapMessageAndObject,
+            },
+            quietReqLogger: true,
+            transport: getPinoTransport(isProduction, logConfig),
+          },
+        }
+      },
+      inject: [TypedConfigService],
+    }),
     TypedConfigModule.forRoot({
       isGlobal: true,
     }),
@@ -54,7 +74,20 @@ import { OpenFeaturePostHogProvider } from './common/providers/openfeature-posth
           migrationsRun: configService.get('runMigrations') || !configService.getOrThrow('production'),
           namingStrategy: new CustomNamingStrategy(),
           manualInitialization: configService.get('skipConnections'),
+          ssl: configService.get('database.tls.enabled')
+            ? {
+                rejectUnauthorized: configService.get('database.tls.rejectUnauthorized'),
+              }
+            : undefined,
         }
+      },
+    }),
+    ServeStaticModule.forRoot({
+      rootPath: join(__dirname, '..'),
+      exclude: ['/api/*'],
+      renderPath: '/runner-amd64',
+      serveStaticOptions: {
+        cacheControl: false,
       },
     }),
     ServeStaticModule.forRoot({
@@ -85,7 +118,9 @@ import { OpenFeaturePostHogProvider } from './common/providers/openfeature-posth
         }
       },
     }),
-    EventEmitterModule.forRoot(),
+    EventEmitterModule.forRoot({
+      maxListeners: 100,
+    }),
     ApiKeyModule,
     AuthModule,
     UserModule,
@@ -136,7 +171,7 @@ import { OpenFeaturePostHogProvider } from './common/providers/openfeature-posth
 })
 export class AppModule implements NestModule {
   configure(consumer: MiddlewareConsumer) {
-    consumer.apply(VersionHeaderMiddleware).forRoutes({ path: '*', method: RequestMethod.ALL })
-    consumer.apply(MaintenanceMiddleware).forRoutes({ path: '*', method: RequestMethod.ALL })
+    consumer.apply(VersionHeaderMiddleware).forRoutes({ path: '{*path}', method: RequestMethod.ALL })
+    consumer.apply(MaintenanceMiddleware).forRoutes({ path: '{*path}', method: RequestMethod.ALL })
   }
 }

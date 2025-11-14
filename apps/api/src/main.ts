@@ -3,28 +3,31 @@
  * SPDX-License-Identifier: AGPL-3.0
  */
 
-import './tracing'
+import { otelSdk } from './tracing'
 import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { NestFactory } from '@nestjs/core'
 import { NestExpressApplication } from '@nestjs/platform-express'
 import { AppModule } from './app.module'
 import { SwaggerModule } from '@nestjs/swagger'
-import { ConsoleLogger, INestApplication, Logger, LogLevel, ValidationPipe } from '@nestjs/common'
-import { HttpAdapterHost } from '@nestjs/core'
+import { INestApplication, Logger, ValidationPipe } from '@nestjs/common'
 import { AllExceptionsFilter } from './filters/all-exceptions.filter'
-import { NotFoundExceptionFilter } from './common/middleware/frontend.middleware'
 import { MetricsInterceptor } from './interceptors/metrics.interceptor'
 import { HttpsOptions } from '@nestjs/common/interfaces/external/https-options.interface'
 import { TypedConfigService } from './config/typed-config.service'
 import { DataSource, MigrationExecutor } from 'typeorm'
 import { RunnerService } from './sandbox/services/runner.service'
 import { getOpenApiConfig } from './openapi.config'
-import { EventEmitter2 } from '@nestjs/event-emitter'
 import { AuditInterceptor } from './audit/interceptors/audit.interceptor'
 import { join } from 'node:path'
 import { ApiKeyService } from './api-key/api-key.service'
 import { DAYTONA_ADMIN_USER_ID } from './app.service'
 import { OrganizationService } from './organization/services/organization.service'
+import { MicroserviceOptions, Transport } from '@nestjs/microservices'
+import { Partitioners } from 'kafkajs'
+import { isApiEnabled, isWorkerEnabled } from './common/utils/app-mode'
+import cluster from 'node:cluster'
+import { Logger as PinoLogger, LoggerErrorInterceptor } from 'nestjs-pino'
+import { RunnerAdapterFactory } from './sandbox/runner-adapter/runnerAdapter'
 
 // https options
 const httpsEnabled = process.env.CERT_PATH && process.env.CERT_KEY_PATH
@@ -33,20 +36,16 @@ const httpsOptions: HttpsOptions = {
   key: process.env.CERT_KEY_PATH ? readFileSync(process.env.CERT_KEY_PATH) : undefined,
 }
 
-// Default log level
-const logLevels: LogLevel[] = ['log', 'error', 'warn']
-if (process.env.LOG_LEVEL) {
-  logLevels.push(process.env.LOG_LEVEL as LogLevel)
-}
-
 async function bootstrap() {
+  if (process.env.OTEL_ENABLED === 'true') {
+    await otelSdk.start()
+  }
   const app = await NestFactory.create<NestExpressApplication>(AppModule, {
-    logger: new ConsoleLogger({
-      prefix: 'API',
-      logLevels,
-    }),
+    bufferLogs: true,
     httpsOptions: httpsEnabled ? httpsOptions : undefined,
   })
+  app.useLogger(app.get(PinoLogger))
+  app.flushLogs()
   app.enableCors({
     origin: true,
     methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
@@ -54,9 +53,9 @@ async function bootstrap() {
   })
 
   const configService = app.get(TypedConfigService)
-  const httpAdapter = app.get(HttpAdapterHost)
-  app.useGlobalFilters(new AllExceptionsFilter(httpAdapter))
-  app.useGlobalFilters(new NotFoundExceptionFilter())
+  app.set('trust proxy', true)
+  app.useGlobalFilters(new AllExceptionsFilter())
+  app.useGlobalInterceptors(new LoggerErrorInterceptor())
   app.useGlobalInterceptors(new MetricsInterceptor(configService))
   app.useGlobalInterceptors(app.get(AuditInterceptor))
   app.useGlobalPipes(
@@ -64,9 +63,6 @@ async function bootstrap() {
       transform: true,
     }),
   )
-
-  const eventEmitter = app.get(EventEmitter2)
-  eventEmitter.setMaxListeners(100)
 
   // Runtime flags for migrations for run and revert migrations
   if (process.argv.length > 2) {
@@ -120,10 +116,11 @@ async function bootstrap() {
   // Auto create runners only in local development environment
   if (configService.get('defaultRunner.domain')) {
     const runnerService = app.get(RunnerService)
+    const runnerAdapterFactory = app.get(RunnerAdapterFactory)
     const runners = await runnerService.findAll()
     if (!runners.find((runner) => runner.domain === configService.getOrThrow('defaultRunner.domain'))) {
       Logger.log(`Creating default runner: ${configService.getOrThrow('defaultRunner.domain')}`)
-      await runnerService.create({
+      const runner = await runnerService.create({
         apiUrl: configService.getOrThrow('defaultRunner.apiUrl'),
         proxyUrl: configService.getOrThrow('defaultRunner.proxyUrl'),
         apiKey: configService.getOrThrow('defaultRunner.apiKey'),
@@ -137,6 +134,21 @@ async function bootstrap() {
         domain: configService.getOrThrow('defaultRunner.domain'),
         version: configService.get('defaultRunner.version') || '0',
       })
+
+      const runnerAdapter = await runnerAdapterFactory.create(runner)
+
+      // Wait until the runner is healthy
+      Logger.log(`Waiting for runner ${runner.domain} to be healthy...`)
+      for (let i = 0; i < 30; i++) {
+        try {
+          await runnerAdapter.healthCheck()
+          Logger.log(`Runner ${runner.domain} is healthy`)
+          break
+        } catch {
+          // ignore
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1000))
+      }
     }
   }
 
@@ -169,10 +181,41 @@ async function bootstrap() {
 
   const host = '0.0.0.0'
   const port = configService.get('port')
-  await app.listen(port, host)
-  Logger.log(`🚀 Daytona API is running on: http://${host}:${port}/${globalPrefix}`)
 
-  if (process.send) {
+  if (isApiEnabled()) {
+    await app.listen(port, host)
+    Logger.log(`🚀 Daytona API is running on: http://${host}:${port}/${globalPrefix}`)
+  } else {
+    await app.init()
+  }
+
+  if (isWorkerEnabled() && configService.get('kafka.enabled')) {
+    app.connectMicroservice<MicroserviceOptions>({
+      transport: Transport.KAFKA,
+      options: {
+        client: configService.getKafkaClientConfig(),
+        producer: {
+          allowAutoTopicCreation: true,
+          createPartitioner: Partitioners.DefaultPartitioner,
+          idempotent: true,
+        },
+        consumer: {
+          allowAutoTopicCreation: true,
+          groupId: 'daytona',
+        },
+        run: {
+          autoCommit: false,
+        },
+        subscribe: {
+          fromBeginning: true,
+        },
+      },
+    })
+    await app.startAllMicroservices()
+  }
+
+  // If app running in cluster mode, send ready signal
+  if (cluster.isWorker) {
     process.send('ready')
   }
 }

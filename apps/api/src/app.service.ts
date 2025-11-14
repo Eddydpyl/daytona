@@ -44,6 +44,7 @@ export class AppService implements OnApplicationBootstrap, OnApplicationShutdown
 
     await this.initializeAdminUser()
     await this.initializeTransientRegistry()
+    await this.initializeBackupRegistry()
     await this.initializeInternalRegistry()
     await this.initializeDefaultSnapshot()
   }
@@ -65,20 +66,27 @@ export class AppService implements OnApplicationBootstrap, OnApplicationShutdown
       id: DAYTONA_ADMIN_USER_ID,
       name: 'Daytona Admin',
       personalOrganizationQuota: {
-        totalCpuQuota: 0,
-        totalMemoryQuota: 0,
-        totalDiskQuota: 0,
-        maxCpuPerSandbox: 0,
-        maxMemoryPerSandbox: 0,
-        maxDiskPerSandbox: 0,
-        snapshotQuota: 100,
-        maxSnapshotSize: 100,
-        volumeQuota: 0,
+        totalCpuQuota: this.configService.getOrThrow('admin.totalCpuQuota'),
+        totalMemoryQuota: this.configService.getOrThrow('admin.totalMemoryQuota'),
+        totalDiskQuota: this.configService.getOrThrow('admin.totalDiskQuota'),
+        maxCpuPerSandbox: this.configService.getOrThrow('admin.maxCpuPerSandbox'),
+        maxMemoryPerSandbox: this.configService.getOrThrow('admin.maxMemoryPerSandbox'),
+        maxDiskPerSandbox: this.configService.getOrThrow('admin.maxDiskPerSandbox'),
+        snapshotQuota: this.configService.getOrThrow('admin.snapshotQuota'),
+        maxSnapshotSize: this.configService.getOrThrow('admin.maxSnapshotSize'),
+        volumeQuota: this.configService.getOrThrow('admin.volumeQuota'),
       },
       role: SystemRole.ADMIN,
     })
     const personalOrg = await this.organizationService.findPersonal(user.id)
-    const { value } = await this.apiKeyService.createApiKey(personalOrg.id, user.id, DAYTONA_ADMIN_USER_ID, [])
+    const { value } = await this.apiKeyService.createApiKey(
+      personalOrg.id,
+      user.id,
+      DAYTONA_ADMIN_USER_ID,
+      [],
+      undefined,
+      this.configService.getOrThrow('admin.apiKey'),
+    )
     this.logger.log(
       `
 =========================================
@@ -149,6 +157,43 @@ Admin user created with API key: ${value}
     })
 
     this.logger.log('Default internal registry initialized successfully')
+  }
+
+  private async initializeBackupRegistry(): Promise<void> {
+    const existingRegistry = await this.dockerRegistryService.getAvailableBackupRegistry(
+      this.configService.getOrThrow('defaultRegion'),
+    )
+    if (existingRegistry) {
+      return
+    }
+
+    const registryUrl = this.configService.getOrThrow('internalRegistry.url')
+    const registryAdmin = this.configService.getOrThrow('internalRegistry.admin')
+    const registryPassword = this.configService.getOrThrow('internalRegistry.password')
+    const registryProjectId = this.configService.getOrThrow('internalRegistry.projectId')
+
+    if (!registryUrl || !registryAdmin || !registryPassword || !registryProjectId) {
+      this.logger.warn('Registry configuration not found, skipping backup registry setup')
+      return
+    }
+
+    this.logger.log('Initializing default backup registry...')
+
+    await this.dockerRegistryService.create(
+      {
+        name: 'Backup Registry',
+        url: registryUrl,
+        username: registryAdmin,
+        password: registryPassword,
+        project: registryProjectId,
+        registryType: RegistryType.BACKUP,
+        isDefault: true,
+      },
+      undefined,
+      true,
+    )
+
+    this.logger.log('Default backup registry initialized successfully')
   }
 
   private async initializeDefaultSnapshot(): Promise<void> {

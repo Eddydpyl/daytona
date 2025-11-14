@@ -9,6 +9,7 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 
@@ -31,9 +32,10 @@ type RunnerInfo struct {
 	ApiKey string `json:"apiKey"`
 }
 
-const DAYTONA_SANDBOX_AUTH_KEY_HEADER = "X-Daytona-Preview-Token"
-const DAYTONA_SANDBOX_AUTH_KEY_QUERY_PARAM = "DAYTONA_SANDBOX_AUTH_KEY"
-const DAYTONA_SANDBOX_AUTH_COOKIE_NAME = "daytona-sandbox-auth-"
+const SANDBOX_AUTH_KEY_HEADER = "X-Daytona-Preview-Token"
+const SANDBOX_AUTH_KEY_QUERY_PARAM = "DAYTONA_SANDBOX_AUTH_KEY"
+const SANDBOX_AUTH_COOKIE_NAME = "daytona-sandbox-auth-"
+const SKIP_LAST_ACTIVITY_UPDATE_HEADER = "X-Daytona-Skip-Last-Activity-Update"
 const TERMINAL_PORT = "22222"
 const TOOLBOX_PORT = "2280"
 
@@ -42,10 +44,11 @@ type Proxy struct {
 	secureCookie *securecookie.SecureCookie
 	cookieDomain string
 
-	apiclient                *apiclient.APIClient
-	runnerCache              common_cache.ICache[RunnerInfo]
-	sandboxPublicCache       common_cache.ICache[bool]
-	sandboxAuthKeyValidCache common_cache.ICache[bool]
+	apiclient                      *apiclient.APIClient
+	runnerCache                    common_cache.ICache[RunnerInfo]
+	sandboxPublicCache             common_cache.ICache[bool]
+	sandboxAuthKeyValidCache       common_cache.ICache[bool]
+	sandboxLastActivityUpdateCache common_cache.ICache[bool]
 }
 
 func StartProxy(config *config.Config) error {
@@ -88,10 +91,15 @@ func StartProxy(config *config.Config) error {
 		if err != nil {
 			return err
 		}
+		proxy.sandboxLastActivityUpdateCache, err = common_cache.NewRedisCache[bool](config.Redis, "proxy:sandbox-last-activity-update:")
+		if err != nil {
+			return err
+		}
 	} else {
 		proxy.runnerCache = common_cache.NewMapCache[RunnerInfo]()
 		proxy.sandboxPublicCache = common_cache.NewMapCache[bool]()
 		proxy.sandboxAuthKeyValidCache = common_cache.NewMapCache[bool]()
+		proxy.sandboxLastActivityUpdateCache = common_cache.NewMapCache[bool]()
 	}
 
 	router := gin.New()
@@ -129,7 +137,7 @@ func StartProxy(config *config.Config) error {
 			return
 		}
 
-		_, _, err := proxy.parseHost(ctx.Request.Host)
+		targetPort, _, err := proxy.parseHost(ctx.Request.Host)
 		// if the host is not valid, we don't proxy the request
 		if err != nil {
 			switch ctx.Request.Method {
@@ -144,11 +152,47 @@ func StartProxy(config *config.Config) error {
 				}
 			}
 
+			if strings.HasPrefix(ctx.Request.URL.Path, "/toolbox/") {
+				_, sandboxID, _, err := proxy.parseToolboxSubpath(ctx.Request.URL.Path)
+				if err != nil {
+					ctx.Error(common_errors.NewNotFoundError(errors.New("not found")))
+					return
+				}
+
+				prefix := fmt.Sprintf("/toolbox/%s", sandboxID)
+
+				getProxyTarget := func(ctx *gin.Context) (*url.URL, map[string]string, error) {
+					return proxy.GetProxyTarget(ctx, true)
+				}
+
+				modifyResponse := func(res *http.Response) error {
+					if res.StatusCode >= 300 && res.StatusCode < 400 {
+						if loc := res.Header.Get("Location"); !strings.HasPrefix(loc, prefix) {
+							res.Header.Set("Location", prefix+loc)
+						}
+					}
+					return nil
+				}
+
+				common_proxy.NewProxyRequestHandler(getProxyTarget, modifyResponse)(ctx)
+				return
+			}
+
 			ctx.Error(common_errors.NewNotFoundError(errors.New("not found")))
 			return
 		}
 
-		common_proxy.NewProxyRequestHandler(proxy.GetProxyTarget)(ctx)
+		// If toolbox only mode is enabled, only allow requests to the toolbox port
+		if targetPort != TOOLBOX_PORT && proxy.config.ToolboxOnlyMode {
+			ctx.Error(common_errors.NewNotFoundError(errors.New("not found")))
+			return
+		}
+
+		getProxyTarget := func(ctx *gin.Context) (*url.URL, map[string]string, error) {
+			return proxy.GetProxyTarget(ctx, false)
+		}
+
+		common_proxy.NewProxyRequestHandler(getProxyTarget, nil)(ctx)
 	})
 
 	httpServer := &http.Server{

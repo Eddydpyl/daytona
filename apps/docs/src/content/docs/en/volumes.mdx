@@ -14,7 +14,7 @@ Volumes are FUSE-based mounts that provide shared file access across Sandboxes. 
 
 Before mounting a volume to a Sandbox, it must be created.
 
-<Tabs>
+<Tabs syncKey="language">
 <TabItem label="Python" icon="seti:python">
 ```bash
 volume = daytona.volume.get("my-volume", create=True)
@@ -31,9 +31,16 @@ See: [volume.get (Python SDK)](/docs/python-sdk/sync/volume/#volumeserviceget), 
 
 ## Mounting Volumes
 
-Once a volume is created, it can be mounted to a Sandbox by specifying it in the `CreateSandboxFromSnapshotParams` object:
+Once a volume is created, it can be mounted to a Sandbox by specifying it in the `CreateSandboxFromSnapshotParams` object. Volume mount paths must meet the following requirements:
 
-<Tabs>
+- **Must be absolute paths**: Mount paths must start with `/` (e.g., `/home/daytona/volume`)
+- **Cannot be root directory**: Cannot mount to `/` or `//`
+- **No relative path components**: Cannot contain `/../`, `/./`, or end with `/..` or `/.`
+- **No consecutive slashes**: Cannot contain multiple consecutive slashes like `//` (except at the beginning)
+- **Cannot mount to system directories**: The following system directories are prohibited:
+  - `/proc`, `/sys`, `/dev`, `/boot`, `/etc`, `/bin`, `/sbin`, `/lib`, `/lib64`
+
+<Tabs syncKey="language">
 <TabItem label="Python" icon="seti:python">
 ```python
 import os
@@ -83,7 +90,7 @@ See: [CreateSandboxFromSnapshotParams (Python SDK)](/docs/python-sdk/sync/dayton
 
 Once mounted, you can read from and write to the volume just like any other directory in the Sandbox file system. Files written to the volume persist beyond the lifecycle of any individual Sandbox.
 
-<Tabs>
+<Tabs syncKey="language">
   <TabItem label="Python" icon="seti:python">
     ```python
     # Write to a file in the mounted volume
@@ -113,7 +120,7 @@ Once mounted, you can read from and write to the volume just like any other dire
 
 When a volume is no longer needed, it can be deleted.
 
-<Tabs>
+<Tabs syncKey="language">
 <TabItem label="Python" icon="seti:python">
 ```python
 volume = daytona.volume.get("my-volume", create=True)

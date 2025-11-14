@@ -18,6 +18,10 @@ const configuration = {
     username: process.env.DB_USERNAME,
     password: process.env.DB_PASSWORD,
     database: process.env.DB_DATABASE,
+    tls: {
+      enabled: process.env.DB_TLS_ENABLED === 'true',
+      rejectUnauthorized: process.env.DB_TLS_REJECT_UNAUTHORIZED !== 'false',
+    },
   },
   redis: {
     host: process.env.REDIS_HOST,
@@ -79,11 +83,15 @@ const configuration = {
   maxAutoArchiveInterval: parseInt(process.env.MAX_AUTO_ARCHIVE_INTERVAL || '43200', 10),
   maintananceMode: process.env.MAINTENANCE_MODE === 'true',
   disableCronJobs: process.env.DISABLE_CRON_JOBS === 'true',
+  appRole: process.env.APP_ROLE || 'all',
   proxy: {
     domain: process.env.PROXY_DOMAIN,
     protocol: process.env.PROXY_PROTOCOL,
     apiKey: process.env.PROXY_API_KEY,
     templateUrl: process.env.PROXY_TEMPLATE_URL,
+    toolboxUrl:
+      (process.env.PROXY_TOOLBOX_BASE_URL || `${process.env.PROXY_PROTOCOL}://${process.env.PROXY_DOMAIN}`) +
+      '/toolbox',
   },
   audit: {
     toolboxRequestsEnabled: process.env.AUDIT_TOOLBOX_REQUESTS_ENABLED === 'true',
@@ -91,6 +99,39 @@ const configuration = {
       ? parseInt(process.env.AUDIT_LOG_RETENTION_DAYS, 10)
       : undefined,
     consoleLogEnabled: process.env.AUDIT_CONSOLE_LOG_ENABLED === 'true',
+    publish: {
+      enabled: process.env.AUDIT_PUBLISH_ENABLED === 'true',
+      batchSize: process.env.AUDIT_PUBLISH_BATCH_SIZE ? parseInt(process.env.AUDIT_PUBLISH_BATCH_SIZE, 10) : 1000,
+      mode: (process.env.AUDIT_PUBLISH_MODE || 'direct') as 'direct' | 'kafka',
+      storageAdapter: process.env.AUDIT_PUBLISH_STORAGE_ADAPTER || 'opensearch',
+      opensearchIndexName: process.env.AUDIT_PUBLISH_OPENSEARCH_INDEX_NAME || 'audit-logs',
+    },
+  },
+  kafka: {
+    enabled: process.env.KAFKA_ENABLED === 'true',
+    brokers: process.env.KAFKA_BROKERS || 'localhost:9092',
+    clientId: process.env.KAFKA_CLIENT_ID,
+    sasl: {
+      mechanism: process.env.KAFKA_SASL_MECHANISM,
+      username: process.env.KAFKA_SASL_USERNAME,
+      password: process.env.KAFKA_SASL_PASSWORD,
+    },
+    tls: {
+      enabled: process.env.KAFKA_TLS_ENABLED === 'true',
+      rejectUnauthorized: process.env.KAFKA_TLS_REJECT_UNAUTHORIZED !== 'false',
+    },
+  },
+  opensearch: {
+    nodes: process.env.OPENSEARCH_NODES || 'https://localhost:9200',
+    username: process.env.OPENSEARCH_USERNAME,
+    password: process.env.OPENSEARCH_PASSWORD,
+    aws: {
+      roleArn: process.env.OPENSEARCH_AWS_ROLE_ARN,
+      region: process.env.OPENSEARCH_AWS_REGION,
+    },
+    tls: {
+      rejectUnauthorized: process.env.OPENSEARCH_TLS_REJECT_UNAUTHORIZED !== 'false',
+    },
   },
   cronTimeZone: process.env.CRON_TIMEZONE,
   maxConcurrentBackupsPerRunner: parseInt(process.env.MAX_CONCURRENT_BACKUPS_PER_RUNNER || '6', 10),
@@ -137,6 +178,44 @@ const configuration = {
     memoryPenaltyThreshold: parseInt(process.env.RUNNER_MEMORY_PENALTY_THRESHOLD || '75', 10),
     diskPenaltyThreshold: parseInt(process.env.RUNNER_DISK_PENALTY_THRESHOLD || '75', 10),
   },
+  apiKey: {
+    validationCacheTtlSeconds: parseInt(process.env.API_KEY_VALIDATION_CACHE_TTL_SECONDS || '10', 10),
+    userCacheTtlSeconds: parseInt(process.env.API_KEY_USER_CACHE_TTL_SECONDS || '60', 10),
+  },
+  log: {
+    console: {
+      disabled: process.env.LOG_CONSOLE_DISABLED === 'true',
+    },
+    level: process.env.LOG_LEVEL || 'info',
+    requests: {
+      enabled: process.env.LOG_REQUESTS_ENABLED === 'true',
+    },
+  },
+  defaultOrganizationQuota: {
+    totalCpuQuota: parseInt(process.env.DEFAULT_ORG_QUOTA_TOTAL_CPU_QUOTA || '10', 10),
+    totalMemoryQuota: parseInt(process.env.DEFAULT_ORG_QUOTA_TOTAL_MEMORY_QUOTA || '10', 10),
+    totalDiskQuota: parseInt(process.env.DEFAULT_ORG_QUOTA_TOTAL_DISK_QUOTA || '30', 10),
+    maxCpuPerSandbox: parseInt(process.env.DEFAULT_ORG_QUOTA_MAX_CPU_PER_SANDBOX || '4', 10),
+    maxMemoryPerSandbox: parseInt(process.env.DEFAULT_ORG_QUOTA_MAX_MEMORY_PER_SANDBOX || '8', 10),
+    maxDiskPerSandbox: parseInt(process.env.DEFAULT_ORG_QUOTA_MAX_DISK_PER_SANDBOX || '10', 10),
+    snapshotQuota: parseInt(process.env.DEFAULT_ORG_QUOTA_SNAPSHOT_QUOTA || '100', 10),
+    maxSnapshotSize: parseInt(process.env.DEFAULT_ORG_QUOTA_MAX_SNAPSHOT_SIZE || '20', 10),
+    volumeQuota: parseInt(process.env.DEFAULT_ORG_QUOTA_VOLUME_QUOTA || '100', 10),
+  },
+  defaultRegion: process.env.DEFAULT_REGION || 'us',
+  admin: {
+    apiKey: process.env.ADMIN_API_KEY,
+    totalCpuQuota: parseInt(process.env.ADMIN_TOTAL_CPU_QUOTA || '0', 10),
+    totalMemoryQuota: parseInt(process.env.ADMIN_TOTAL_MEMORY_QUOTA || '0', 10),
+    totalDiskQuota: parseInt(process.env.ADMIN_TOTAL_DISK_QUOTA || '0', 10),
+    maxCpuPerSandbox: parseInt(process.env.ADMIN_MAX_CPU_PER_SANDBOX || '0', 10),
+    maxMemoryPerSandbox: parseInt(process.env.ADMIN_MAX_MEMORY_PER_SANDBOX || '0', 10),
+    maxDiskPerSandbox: parseInt(process.env.ADMIN_MAX_DISK_PER_SANDBOX || '0', 10),
+    snapshotQuota: parseInt(process.env.ADMIN_SNAPSHOT_QUOTA || '100', 10),
+    maxSnapshotSize: parseInt(process.env.ADMIN_MAX_SNAPSHOT_SIZE || '100', 10),
+    volumeQuota: parseInt(process.env.ADMIN_VOLUME_QUOTA || '0', 10),
+  },
+  skipUserEmailVerification: process.env.SKIP_USER_EMAIL_VERIFICATION === 'true',
 }
 
 export { configuration }

@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: AGPL-3.0
  */
 
-import { Module, MiddlewareConsumer, RequestMethod } from '@nestjs/common'
-import { RequestLoggerMiddleware } from './middleware/request-logger.middleware'
+import { Module } from '@nestjs/common'
+import { DataSource } from 'typeorm'
 import { SandboxController } from './controllers/sandbox.controller'
 import { SandboxService } from './services/sandbox.service'
 import { TypeOrmModule } from '@nestjs/typeorm'
@@ -13,10 +13,10 @@ import { UserModule } from '../user/user.module'
 import { RunnerService } from './services/runner.service'
 import { Runner } from './entities/runner.entity'
 import { RunnerController } from './controllers/runner.controller'
-import { ToolboxService } from './services/toolbox.service'
+import { ToolboxService } from './services/toolbox.deprecated.service'
 import { DockerRegistryModule } from '../docker-registry/docker-registry.module'
 import { SandboxManager } from './managers/sandbox.manager'
-import { ToolboxController } from './controllers/toolbox.controller'
+import { ToolboxController } from './controllers/toolbox.deprecated.controller'
 import { Snapshot } from './entities/snapshot.entity'
 import { SnapshotController } from './controllers/snapshot.controller'
 import { SnapshotService } from './services/snapshot.service'
@@ -45,6 +45,7 @@ import { SandboxStopAction } from './managers/sandbox-actions/sandbox-stop.actio
 import { SandboxDestroyAction } from './managers/sandbox-actions/sandbox-destroy.action'
 import { SandboxArchiveAction } from './managers/sandbox-actions/sandbox-archive.action'
 import { SshAccess } from './entities/ssh-access.entity'
+import { SandboxRepository } from './repositories/sandbox.repository'
 
 @Module({
   imports: [
@@ -93,11 +94,20 @@ import { SshAccess } from './entities/ssh-access.entity'
     SandboxStopAction,
     SandboxDestroyAction,
     SandboxArchiveAction,
+    {
+      provide: SandboxRepository,
+      inject: [DataSource],
+      useFactory: (dataSource: DataSource) => new SandboxRepository(dataSource),
+    },
   ],
-  exports: [SandboxService, RunnerService, RedisLockProvider, SnapshotService, VolumeService, VolumeManager],
+  exports: [
+    SandboxService,
+    RunnerService,
+    RedisLockProvider,
+    SnapshotService,
+    VolumeService,
+    VolumeManager,
+    SandboxRepository,
+  ],
 })
-export class SandboxModule {
-  configure(consumer: MiddlewareConsumer) {
-    consumer.apply(RequestLoggerMiddleware).forRoutes({ path: 'sandbox', method: RequestMethod.POST })
-  }
-}
+export class SandboxModule {}

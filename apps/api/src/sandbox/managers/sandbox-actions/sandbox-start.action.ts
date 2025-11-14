@@ -5,6 +5,7 @@
 
 import { Injectable, Logger, NotFoundException } from '@nestjs/common'
 import { Repository } from 'typeorm'
+import { RECOVERY_ERROR_SUBSTRINGS } from '../../constants/errors-for-recovery'
 import { Sandbox } from '../../entities/sandbox.entity'
 import { SandboxState } from '../../enums/sandbox-state.enum'
 import { DONT_SYNC_AGAIN, SandboxAction, SYNC_AGAIN, SyncState } from './sandbox.action'
@@ -18,12 +19,13 @@ import { DockerRegistryService } from '../../../docker-registry/services/docker-
 import { DockerRegistry } from '../../../docker-registry/entities/docker-registry.entity'
 import { RunnerService } from '../../services/runner.service'
 import { RunnerAdapterFactory } from '../../runner-adapter/runnerAdapter'
-import { ToolboxService } from '../../services/toolbox.service'
 import { InjectRepository } from '@nestjs/typeorm'
 import { Snapshot } from '../../entities/snapshot.entity'
 import { OrganizationService } from '../../../organization/services/organization.service'
 import { TypedConfigService } from '../../../config/typed-config.service'
 import { Runner } from '../../entities/runner.entity'
+import { Organization } from '../../../organization/entities/organization.entity'
+import { LockCode, RedisLockProvider } from '../../common/redis-lock.provider'
 
 @Injectable()
 export class SandboxStartAction extends SandboxAction {
@@ -33,39 +35,39 @@ export class SandboxStartAction extends SandboxAction {
     protected runnerAdapterFactory: RunnerAdapterFactory,
     @InjectRepository(Sandbox)
     protected sandboxRepository: Repository<Sandbox>,
-    protected toolboxService: ToolboxService,
     protected readonly dockerProvider: DockerProvider,
     protected readonly snapshotService: SnapshotService,
     protected readonly dockerRegistryService: DockerRegistryService,
     protected readonly organizationService: OrganizationService,
     protected readonly configService: TypedConfigService,
+    protected readonly redisLockProvider: RedisLockProvider,
   ) {
-    super(runnerService, runnerAdapterFactory, sandboxRepository, toolboxService)
+    super(runnerService, runnerAdapterFactory, sandboxRepository, redisLockProvider)
   }
 
-  async run(sandbox: Sandbox): Promise<SyncState> {
+  async run(sandbox: Sandbox, lockCode: LockCode): Promise<SyncState> {
     switch (sandbox.state) {
       case SandboxState.PENDING_BUILD: {
-        return this.handleUnassignedBuildSandbox(sandbox)
+        return this.handleUnassignedBuildSandbox(sandbox, lockCode)
       }
       case SandboxState.BUILDING_SNAPSHOT: {
-        return this.handleRunnerSandboxBuildingSnapshotStateOnDesiredStateStart(sandbox)
+        return this.handleRunnerSandboxBuildingSnapshotStateOnDesiredStateStart(sandbox, lockCode)
       }
       case SandboxState.UNKNOWN: {
-        return this.handleRunnerSandboxUnknownStateOnDesiredStateStart(sandbox)
+        return this.handleRunnerSandboxUnknownStateOnDesiredStateStart(sandbox, lockCode)
       }
       case SandboxState.ARCHIVED:
       case SandboxState.ARCHIVING:
       case SandboxState.STOPPED: {
-        return this.handleRunnerSandboxStoppedOrArchivedStateOnDesiredStateStart(sandbox)
+        return this.handleRunnerSandboxStoppedOrArchivedStateOnDesiredStateStart(sandbox, lockCode)
       }
       case SandboxState.RESTORING:
       case SandboxState.CREATING: {
-        return this.handleRunnerSandboxPullingSnapshotStateCheck(sandbox)
+        return this.handleRunnerSandboxPullingSnapshotStateCheck(sandbox, lockCode)
       }
       case SandboxState.PULLING_SNAPSHOT:
       case SandboxState.STARTING: {
-        return this.handleRunnerSandboxStartedStateCheck(sandbox)
+        return this.handleRunnerSandboxStartedStateCheck(sandbox, lockCode)
       }
       case SandboxState.ERROR: {
         const runner = await this.runnerService.findOne(sandbox.runnerId)
@@ -87,6 +89,7 @@ export class SandboxStartAction extends SandboxAction {
           }
 
           await this.sandboxRepository.save(sandboxToUpdate)
+          return DONT_SYNC_AGAIN
         }
       }
     }
@@ -94,7 +97,7 @@ export class SandboxStartAction extends SandboxAction {
     return DONT_SYNC_AGAIN
   }
 
-  private async handleUnassignedBuildSandbox(sandbox: Sandbox): Promise<SyncState> {
+  private async handleUnassignedBuildSandbox(sandbox: Sandbox, lockCode: LockCode): Promise<SyncState> {
     // Try to assign an available runner with the snapshot build
     let runnerId: string
     try {
@@ -109,7 +112,7 @@ export class SandboxStartAction extends SandboxAction {
     }
 
     if (runnerId) {
-      await this.updateSandboxState(sandbox.id, SandboxState.UNKNOWN, runnerId)
+      await this.updateSandboxState(sandbox.id, SandboxState.UNKNOWN, lockCode, runnerId)
       return SYNC_AGAIN
     }
 
@@ -120,10 +123,16 @@ export class SandboxStartAction extends SandboxAction {
       const runner = await this.runnerService.findOne(snapshotRunner.runnerId)
       if (runner.availabilityScore >= this.configService.getOrThrow('runnerUsage.declarativeBuildScoreThreshold')) {
         if (snapshotRunner.state === SnapshotRunnerState.BUILDING_SNAPSHOT) {
-          await this.updateSandboxState(sandbox.id, SandboxState.BUILDING_SNAPSHOT, runner.id)
+          await this.updateSandboxState(sandbox.id, SandboxState.BUILDING_SNAPSHOT, lockCode, runner.id)
           return SYNC_AGAIN
         } else if (snapshotRunner.state === SnapshotRunnerState.ERROR) {
-          await this.updateSandboxState(sandbox.id, SandboxState.BUILD_FAILED, undefined, snapshotRunner.errorReason)
+          await this.updateSandboxState(
+            sandbox.id,
+            SandboxState.BUILD_FAILED,
+            lockCode,
+            undefined,
+            snapshotRunner.errorReason,
+          )
           return DONT_SYNC_AGAIN
         }
       }
@@ -141,22 +150,31 @@ export class SandboxStartAction extends SandboxAction {
 
     this.buildOnRunner(sandbox.buildInfo, runnerId, sandbox.organizationId)
 
-    await this.updateSandboxState(sandbox.id, SandboxState.BUILDING_SNAPSHOT, runnerId)
+    await this.updateSandboxState(sandbox.id, SandboxState.BUILDING_SNAPSHOT, lockCode, runnerId)
 
     return SYNC_AGAIN
   }
 
-  private async handleRunnerSandboxBuildingSnapshotStateOnDesiredStateStart(sandbox: Sandbox): Promise<SyncState> {
+  private async handleRunnerSandboxBuildingSnapshotStateOnDesiredStateStart(
+    sandbox: Sandbox,
+    lockCode: LockCode,
+  ): Promise<SyncState> {
     const snapshotRunner = await this.runnerService.getSnapshotRunner(sandbox.runnerId, sandbox.buildInfo.snapshotRef)
     if (snapshotRunner) {
       switch (snapshotRunner.state) {
         case SnapshotRunnerState.READY: {
           // TODO: "UNKNOWN" should probably be changed to something else
-          await this.updateSandboxState(sandbox.id, SandboxState.UNKNOWN)
+          await this.updateSandboxState(sandbox.id, SandboxState.UNKNOWN, lockCode)
           return SYNC_AGAIN
         }
         case SnapshotRunnerState.ERROR: {
-          await this.updateSandboxState(sandbox.id, SandboxState.BUILD_FAILED, undefined, snapshotRunner.errorReason)
+          await this.updateSandboxState(
+            sandbox.id,
+            SandboxState.BUILD_FAILED,
+            lockCode,
+            undefined,
+            snapshotRunner.errorReason,
+          )
           return DONT_SYNC_AGAIN
         }
       }
@@ -170,7 +188,10 @@ export class SandboxStartAction extends SandboxAction {
     return DONT_SYNC_AGAIN
   }
 
-  private async handleRunnerSandboxUnknownStateOnDesiredStateStart(sandbox: Sandbox): Promise<SyncState> {
+  private async handleRunnerSandboxUnknownStateOnDesiredStateStart(
+    sandbox: Sandbox,
+    lockCode: LockCode,
+  ): Promise<SyncState> {
     const runner = await this.runnerService.findOne(sandbox.runnerId)
     if (runner.state !== RunnerState.READY) {
       return DONT_SYNC_AGAIN
@@ -214,12 +235,15 @@ export class SandboxStartAction extends SandboxAction {
 
     await runnerAdapter.createSandbox(sandbox, registry, entrypoint, metadata)
 
-    await this.updateSandboxState(sandbox.id, SandboxState.CREATING)
+    await this.updateSandboxState(sandbox.id, SandboxState.CREATING, lockCode)
     //  sync states again immediately for sandbox
     return SYNC_AGAIN
   }
 
-  private async handleRunnerSandboxStoppedOrArchivedStateOnDesiredStateStart(sandbox: Sandbox): Promise<SyncState> {
+  private async handleRunnerSandboxStoppedOrArchivedStateOnDesiredStateStart(
+    sandbox: Sandbox,
+    lockCode: LockCode,
+  ): Promise<SyncState> {
     const organization = await this.organizationService.findOne(sandbox.organizationId)
 
     //  check if sandbox is assigned to a runner and if that runner is unschedulable
@@ -237,12 +261,10 @@ export class SandboxStartAction extends SandboxAction {
         sandbox.prevRunnerId = originalRunnerId
         sandbox.runnerId = null
 
-        const sandboxToUpdate = await this.sandboxRepository.findOneByOrFail({
-          id: sandbox.id,
+        await this.sandboxRepository.update(sandbox.id, {
+          prevRunnerId: originalRunnerId,
+          runnerId: null,
         })
-        sandboxToUpdate.prevRunnerId = originalRunnerId
-        sandboxToUpdate.runnerId = null
-        await this.sandboxRepository.save(sandboxToUpdate)
       }
 
       // If the sandbox is on a runner and its backupState is COMPLETED
@@ -284,124 +306,17 @@ export class SandboxStartAction extends SandboxAction {
         await this.updateSandboxState(
           sandbox.id,
           SandboxState.ERROR,
+          lockCode,
           undefined,
           'Sandbox has no runner and backup is not completed',
         )
         return DONT_SYNC_AGAIN
       }
 
-      if (!sandbox.backupRegistryId) {
-        throw new Error('No registry found for backup')
+      const syncCheck = await this.restoreSandboxOnNewRunner(sandbox, lockCode, organization, sandbox.prevRunnerId)
+      if (syncCheck !== null) {
+        return syncCheck
       }
-
-      const registry = await this.dockerRegistryService.findOne(sandbox.backupRegistryId)
-      if (!registry) {
-        throw new Error('No registry found for backup')
-      }
-
-      const existingBackups = sandbox.existingBackupSnapshots
-        .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
-        .map((existingSnapshot) => existingSnapshot.snapshotName)
-
-      let validBackup: string | null = null
-      let exists = false
-
-      while (existingBackups.length > 0) {
-        try {
-          if (!validBackup) {
-            //  last snapshot is the current snapshot, so we don't need to check it
-            //  just in case, we'll use the value from the backupSnapshot property
-            validBackup = sandbox.backupSnapshot
-            existingBackups.pop()
-          } else {
-            validBackup = existingBackups.pop()
-          }
-          if (await this.dockerProvider.checkImageExistsInRegistry(validBackup, registry)) {
-            exists = true
-            break
-          }
-        } catch (error) {
-          this.logger.error(
-            `Failed to check if backup snapshot ${sandbox.backupSnapshot} exists in registry ${registry.id}:`,
-            error,
-          )
-        }
-      }
-
-      if (!exists) {
-        await this.updateSandboxState(sandbox.id, SandboxState.ERROR, undefined, 'No valid backup snapshot found')
-        return SYNC_AGAIN
-      }
-
-      //  make sure we pick a runner that has the base snapshot
-      let baseSnapshot: Snapshot | null = null
-      if (sandbox.snapshot) {
-        try {
-          baseSnapshot = await this.snapshotService.getSnapshotByName(sandbox.snapshot, sandbox.organizationId)
-        } catch (e) {
-          if (e instanceof NotFoundException) {
-            //  if the base snapshot is not found, we'll use any available runner later
-          } else {
-            //  for all other errors, throw them
-            throw e
-          }
-        }
-      }
-
-      const snapshotRef = baseSnapshot ? baseSnapshot.internalName : null
-
-      let availableRunners: Runner[] = []
-
-      const runnersWithBaseSnapshot: Runner[] = snapshotRef
-        ? await this.runnerService.findAvailableRunners({
-            region: sandbox.region,
-            sandboxClass: sandbox.class,
-            snapshotRef,
-          })
-        : []
-      if (runnersWithBaseSnapshot.length > 0) {
-        availableRunners = runnersWithBaseSnapshot
-      } else {
-        //  if no runner has the base snapshot, get all available runners
-        availableRunners = await this.runnerService.findAvailableRunners({
-          region: sandbox.region,
-          sandboxClass: sandbox.class,
-        })
-      }
-
-      //  check if we have any available runners after filtering
-      if (availableRunners.length === 0) {
-        // Sync state again later. Runners are unavailable
-        return DONT_SYNC_AGAIN
-      }
-
-      //  get random runner from available runners
-      const randomRunnerIndex = (min: number, max: number) => Math.floor(Math.random() * (max - min + 1) + min)
-      const runner = availableRunners[randomRunnerIndex(0, availableRunners.length - 1)]
-
-      //  verify the runner is still available and ready
-      if (!runner || runner.state !== RunnerState.READY || runner.unschedulable) {
-        this.logger.warn(`Selected runner ${runner.id} is no longer available, retrying sandbox assignment`)
-        return SYNC_AGAIN
-      }
-
-      const runnerAdapter = await this.runnerAdapterFactory.create(runner)
-
-      await this.updateSandboxState(sandbox.id, SandboxState.RESTORING, runner.id)
-
-      sandbox.snapshot = validBackup
-
-      let metadata: { [key: string]: string } | undefined = undefined
-      if (organization) {
-        metadata = {
-          limitNetworkEgress: String(organization.sandboxLimitedNetworkEgress),
-          organizationId: organization.id,
-          organizationName: organization.name,
-          sandboxName: sandbox.name,
-        }
-      }
-
-      await runnerAdapter.createSandbox(sandbox, registry, undefined, metadata)
     } else {
       // if sandbox has runner, start sandbox
       const runner = await this.runnerService.findOne(sandbox.runnerId)
@@ -419,10 +334,28 @@ export class SandboxStartAction extends SandboxAction {
         }
       }
 
-      await runnerAdapter.startSandbox(sandbox.id, metadata)
+      try {
+        await runnerAdapter.startSandbox(sandbox.id, metadata)
+      } catch (error) {
+        // Check against a list of substrings that should trigger an automatic recovery
+        if (error?.message) {
+          const matchesRecovery = RECOVERY_ERROR_SUBSTRINGS.some((substring) =>
+            error.message.toLowerCase().includes(substring.toLowerCase()),
+          )
+          if (matchesRecovery) {
+            try {
+              await this.restoreSandboxOnNewRunner(sandbox, lockCode, organization, sandbox.runnerId, true)
+              this.logger.warn(`Sandbox ${sandbox.id} transferred to a new runner`)
+              return SYNC_AGAIN
+            } catch (restoreError) {
+              this.logger.warn(`Sandbox ${sandbox.id} recovery attempt failed:`, restoreError.message)
+            }
+          }
+        }
+        throw error
+      }
 
-      await this.updateSandboxState(sandbox.id, SandboxState.STARTING)
-
+      await this.updateSandboxState(sandbox.id, SandboxState.STARTING, lockCode)
       return SYNC_AGAIN
     }
 
@@ -430,7 +363,7 @@ export class SandboxStartAction extends SandboxAction {
   }
 
   //  used to check if sandbox is pulling snapshot on runner and update sandbox state accordingly
-  private async handleRunnerSandboxPullingSnapshotStateCheck(sandbox: Sandbox): Promise<SyncState> {
+  private async handleRunnerSandboxPullingSnapshotStateCheck(sandbox: Sandbox, lockCode: LockCode): Promise<SyncState> {
     //  edge case when sandbox is being transferred to a new runner
     if (!sandbox.runnerId) {
       return SYNC_AGAIN
@@ -441,11 +374,19 @@ export class SandboxStartAction extends SandboxAction {
     const sandboxInfo = await runnerAdapter.sandboxInfo(sandbox.id)
 
     if (sandboxInfo.state === SandboxState.PULLING_SNAPSHOT) {
-      await this.updateSandboxState(sandbox.id, SandboxState.PULLING_SNAPSHOT)
+      await this.updateSandboxState(sandbox.id, SandboxState.PULLING_SNAPSHOT, lockCode)
     } else if (sandboxInfo.state === SandboxState.ERROR) {
-      await this.updateSandboxState(sandbox.id, SandboxState.ERROR)
+      await this.updateSandboxState(
+        sandbox.id,
+        SandboxState.ERROR,
+        lockCode,
+        undefined,
+        'Sandbox is in error state on runner',
+      )
+    } else if (sandboxInfo.state === SandboxState.UNKNOWN) {
+      await this.updateSandboxState(sandbox.id, SandboxState.UNKNOWN, lockCode)
     } else {
-      await this.updateSandboxState(sandbox.id, SandboxState.STARTING)
+      await this.updateSandboxState(sandbox.id, SandboxState.STARTING, lockCode)
     }
 
     return SYNC_AGAIN
@@ -453,7 +394,7 @@ export class SandboxStartAction extends SandboxAction {
 
   //  used to check if sandbox is started on runner and update sandbox state accordingly
   //  also used to handle the case where a sandbox is started on a runner and then transferred to a new runner
-  private async handleRunnerSandboxStartedStateCheck(sandbox: Sandbox): Promise<SyncState> {
+  private async handleRunnerSandboxStartedStateCheck(sandbox: Sandbox, lockCode: LockCode): Promise<SyncState> {
     const runner = await this.runnerService.findOne(sandbox.runnerId)
     const runnerAdapter = await this.runnerAdapterFactory.create(runner)
     const sandboxInfo = await runnerAdapter.sandboxInfo(sandbox.id)
@@ -480,65 +421,16 @@ export class SandboxStartAction extends SandboxAction {
             sandboxToUpdate.daemonVersion = daemonVersion
           }
           await this.sandboxRepository.save(sandboxToUpdate)
+          return DONT_SYNC_AGAIN
         } else {
-          await this.updateSandboxState(sandbox.id, SandboxState.STARTED, undefined, undefined, daemonVersion)
-        }
+          await this.updateSandboxState(sandbox.id, SandboxState.STARTED, lockCode, undefined, undefined, daemonVersion)
 
-        //  if sandbox was transferred to a new runner, remove it from the old runner
-        if (sandbox.prevRunnerId) {
-          const runner = await this.runnerService.findOne(sandbox.prevRunnerId)
-          if (!runner) {
-            this.logger.warn(`Previously assigned runner ${sandbox.prevRunnerId} for sandbox ${sandbox.id} not found`)
-            //  clear prevRunnerId to avoid trying to cleanup on a non-existent runner
-            sandbox.prevRunnerId = null
-
-            const sandboxToUpdate = await this.sandboxRepository.findOneByOrFail({
-              id: sandbox.id,
-            })
-            sandboxToUpdate.prevRunnerId = null
-            await this.sandboxRepository.save(sandboxToUpdate)
-            break
+          //  if sandbox was transferred to a new runner, remove it from the old runner
+          if (sandbox.prevRunnerId) {
+            await this.removeSandboxFromPreviousRunner(sandbox)
           }
 
-          const runnerAdapter = await this.runnerAdapterFactory.create(runner)
-
-          try {
-            // First try to destroy the sandbox
-            await runnerAdapter.destroySandbox(sandbox.id)
-
-            // Wait for sandbox to be destroyed before removing
-            let retries = 0
-            while (retries < 10) {
-              try {
-                const sandboxInfo = await runnerAdapter.sandboxInfo(sandbox.id)
-                if (sandboxInfo.state === SandboxState.DESTROYED) {
-                  break
-                }
-              } catch (e) {
-                if (e.response?.status === 404) {
-                  break // Sandbox already gone
-                }
-                throw e
-              }
-              await new Promise((resolve) => setTimeout(resolve, 1000 * retries))
-              retries++
-            }
-
-            // Finally remove the destroyed sandbox
-            await runnerAdapter.removeDestroyedSandbox(sandbox.id)
-
-            sandbox.prevRunnerId = null
-
-            const sandboxToUpdate = await this.sandboxRepository.findOneByOrFail({
-              id: sandbox.id,
-            })
-
-            sandboxToUpdate.prevRunnerId = null
-
-            await this.sandboxRepository.save(sandboxToUpdate)
-          } catch (error) {
-            this.logger.error(`Failed to cleanup sandbox ${sandbox.id} on previous runner ${runner.id}:`, error)
-          }
+          return DONT_SYNC_AGAIN
         }
         break
       }
@@ -547,14 +439,30 @@ export class SandboxStartAction extends SandboxAction {
       case SandboxState.CREATING: {
         break
       }
+      case SandboxState.UNKNOWN: {
+        await this.updateSandboxState(sandbox.id, SandboxState.UNKNOWN, lockCode)
+        break
+      }
       case SandboxState.ERROR: {
-        await this.updateSandboxState(sandbox.id, SandboxState.ERROR)
+        await this.updateSandboxState(
+          sandbox.id,
+          SandboxState.ERROR,
+          lockCode,
+          undefined,
+          'Sandbox entered error state on runner during startup wait loop',
+        )
         break
       }
       // also any other state that is not STARTED
       default: {
         console.error(`Sandbox ${sandbox.id} is in unexpected state ${sandboxInfo.state}`)
-        await this.updateSandboxState(sandbox.id, SandboxState.ERROR)
+        await this.updateSandboxState(
+          sandbox.id,
+          SandboxState.ERROR,
+          lockCode,
+          undefined,
+          `Sandbox is in unexpected state: ${sandboxInfo.state}`,
+        )
         break
       }
     }
@@ -640,5 +548,205 @@ export class SandboxStartAction extends SandboxAction {
     }
 
     await this.runnerService.createSnapshotRunner(runnerId, buildInfo.snapshotRef, state)
+  }
+
+  private async restoreSandboxOnNewRunner(
+    sandbox: Sandbox,
+    lockCode: LockCode,
+    organization: Organization,
+    excludedRunnerId: string,
+    isRecovery?: boolean,
+  ): Promise<SyncState | null> {
+    let lockKey: string | null = null
+    // Recovery lock to prevent frequent automatic restore attempts
+    if (isRecovery) {
+      lockKey = `sandbox-${sandbox.id}-restored-cooldown`
+      const sixHoursInSeconds = 6 * 60 * 60
+      const acquired = await this.redisLockProvider.lock(lockKey, sixHoursInSeconds)
+      if (!acquired) {
+        return null
+      }
+    }
+
+    if (!sandbox.backupRegistryId) {
+      throw new Error('No registry found for backup')
+    }
+
+    const registry = await this.dockerRegistryService.findOne(sandbox.backupRegistryId)
+    if (!registry) {
+      throw new Error('No registry found for backup')
+    }
+
+    const existingBackups = sandbox.existingBackupSnapshots
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+      .map((existingSnapshot) => existingSnapshot.snapshotName)
+
+    let validBackup: string | null = null
+    let exists = false
+
+    while (existingBackups.length > 0) {
+      try {
+        if (!validBackup) {
+          //  last snapshot is the current snapshot, so we don't need to check it
+          //  just in case, we'll use the value from the backupSnapshot property
+          validBackup = sandbox.backupSnapshot
+          existingBackups.pop()
+        } else {
+          validBackup = existingBackups.pop()
+        }
+        if (await this.dockerProvider.checkImageExistsInRegistry(validBackup, registry)) {
+          exists = true
+          break
+        }
+      } catch (error) {
+        this.logger.error(
+          `Failed to check if backup snapshot ${sandbox.backupSnapshot} exists in registry ${registry.id}:`,
+          error,
+        )
+      }
+    }
+
+    if (!exists) {
+      if (!isRecovery) {
+        await this.updateSandboxState(
+          sandbox.id,
+          SandboxState.ERROR,
+          lockCode,
+          undefined,
+          'No valid backup snapshot found',
+        )
+      } else {
+        throw new Error('No valid backup snapshot found')
+      }
+      return SYNC_AGAIN
+    }
+
+    //  make sure we pick a runner that has the base snapshot
+    let baseSnapshot: Snapshot | null = null
+    if (sandbox.snapshot) {
+      try {
+        baseSnapshot = await this.snapshotService.getSnapshotByName(sandbox.snapshot, sandbox.organizationId)
+      } catch (e) {
+        if (e instanceof NotFoundException) {
+          //  if the base snapshot is not found, we'll use any available runner later
+        } else {
+          if (isRecovery) {
+            return SYNC_AGAIN
+          }
+          //  for all other errors, throw them
+          throw e
+        }
+      }
+    }
+
+    const snapshotRef = baseSnapshot ? baseSnapshot.internalName : null
+
+    let availableRunners: Runner[] = []
+
+    const runnersWithBaseSnapshot: Runner[] = snapshotRef
+      ? await this.runnerService.findAvailableRunners({
+          region: sandbox.region,
+          sandboxClass: sandbox.class,
+          snapshotRef,
+          excludedRunnerIds: [excludedRunnerId],
+        })
+      : []
+    if (runnersWithBaseSnapshot.length > 0) {
+      availableRunners = runnersWithBaseSnapshot
+    } else {
+      //  if no runner has the base snapshot, get all available runners
+      availableRunners = await this.runnerService.findAvailableRunners({
+        region: sandbox.region,
+        sandboxClass: sandbox.class,
+        excludedRunnerIds: [excludedRunnerId],
+      })
+    }
+
+    //  check if we have any available runners after filtering
+    if (availableRunners.length === 0) {
+      // Sync state again later. Runners are unavailable
+      if (isRecovery) {
+        await this.redisLockProvider.unlock(lockKey)
+      }
+      return DONT_SYNC_AGAIN
+    }
+
+    //  get random runner from available runners
+    const randomRunnerIndex = (min: number, max: number) => Math.floor(Math.random() * (max - min + 1) + min)
+    const runner = availableRunners[randomRunnerIndex(0, availableRunners.length - 1)]
+
+    //  verify the runner is still available and ready
+    if (!runner || runner.state !== RunnerState.READY || runner.unschedulable) {
+      this.logger.warn(`Selected runner ${runner.id} is no longer available, retrying sandbox assignment`)
+      if (isRecovery) {
+        await this.redisLockProvider.unlock(lockKey)
+      }
+      return SYNC_AGAIN
+    }
+
+    const runnerAdapter = await this.runnerAdapterFactory.create(runner)
+
+    await this.updateSandboxState(sandbox.id, SandboxState.RESTORING, lockCode, runner.id)
+
+    sandbox.snapshot = validBackup
+
+    let metadata: { [key: string]: string } | undefined = undefined
+    if (organization) {
+      metadata = {
+        limitNetworkEgress: String(organization.sandboxLimitedNetworkEgress),
+        organizationId: organization.id,
+        organizationName: organization.name,
+        sandboxName: sandbox.name,
+      }
+    }
+
+    await runnerAdapter.createSandbox(sandbox, registry, undefined, metadata)
+    return null
+  }
+
+  private async removeSandboxFromPreviousRunner(sandbox: Sandbox): Promise<void> {
+    const runner = await this.runnerService.findOne(sandbox.prevRunnerId)
+    if (!runner) {
+      this.logger.warn(`Previously assigned runner ${sandbox.prevRunnerId} for sandbox ${sandbox.id} not found`)
+
+      await this.sandboxRepository.update(sandbox.id, {
+        prevRunnerId: null,
+      })
+      return
+    }
+
+    const runnerAdapter = await this.runnerAdapterFactory.create(runner)
+
+    try {
+      // First try to destroy the sandbox
+      await runnerAdapter.destroySandbox(sandbox.id)
+
+      // Wait for sandbox to be destroyed before removing
+      let retries = 0
+      while (retries < 10) {
+        try {
+          const sandboxInfo = await runnerAdapter.sandboxInfo(sandbox.id)
+          if (sandboxInfo.state === SandboxState.DESTROYED) {
+            break
+          }
+        } catch (e) {
+          if (e.response?.status === 404) {
+            break // Sandbox already gone
+          }
+          throw e
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1000 * retries))
+        retries++
+      }
+
+      // Finally remove the destroyed sandbox
+      await runnerAdapter.removeDestroyedSandbox(sandbox.id)
+
+      await this.sandboxRepository.update(sandbox.id, {
+        prevRunnerId: null,
+      })
+    } catch (error) {
+      this.logger.error(`Failed to cleanup sandbox ${sandbox.id} on previous runner ${runner.id}:`, error)
+    }
   }
 }

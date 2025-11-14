@@ -96,13 +96,13 @@ func (p *Proxy) AuthCallback(ctx *gin.Context) {
 		return
 	}
 
-	encoded, err := p.secureCookie.Encode(DAYTONA_SANDBOX_AUTH_COOKIE_NAME+sandboxId, sandboxId)
+	encoded, err := p.secureCookie.Encode(SANDBOX_AUTH_COOKIE_NAME+sandboxId, sandboxId)
 	if err != nil {
 		ctx.Error(common_errors.NewBadRequestError(fmt.Errorf("failed to encode cookie: %w", err)))
 		return
 	}
 
-	ctx.SetCookie(DAYTONA_SANDBOX_AUTH_COOKIE_NAME+sandboxId, encoded, 3600, "/", p.cookieDomain, p.config.EnableTLS, true)
+	ctx.SetCookie(SANDBOX_AUTH_COOKIE_NAME+sandboxId, encoded, 3600, "/", p.cookieDomain, p.config.EnableTLS, true)
 
 	// Redirect back to the original URL
 	ctx.Redirect(http.StatusFound, returnTo)
@@ -158,7 +158,7 @@ func (p *Proxy) hasSandboxAccess(ctx context.Context, sandboxId string, authToke
 
 	apiClient := apiclient.NewAPIClient(clientConfig)
 
-	res, _ := apiClient.PreviewAPI.HasSandboxAccess(ctx, sandboxId).Execute()
+	_, res, _ := apiClient.PreviewAPI.HasSandboxAccess(ctx, sandboxId).Execute()
 
 	return res != nil && res.StatusCode == http.StatusOK
 }

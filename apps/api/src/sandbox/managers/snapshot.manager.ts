@@ -33,6 +33,8 @@ import { TrackJobExecution } from '../../common/decorators/track-job-execution.d
 import { setTimeout as sleep } from 'timers/promises'
 import { TypedConfigService } from '../../config/typed-config.service'
 import { LogExecution } from '../../common/decorators/log-execution.decorator'
+import { PER_SANDBOX_LIMIT_MESSAGE } from '../../common/constants/error-messages'
+import { WithInstrumentation } from '../../common/decorators/otel.decorator'
 
 @Injectable()
 export class SnapshotManager implements TrackableJobExecutions, OnApplicationShutdown {
@@ -73,6 +75,7 @@ export class SnapshotManager implements TrackableJobExecutions, OnApplicationShu
   @Cron(CronExpression.EVERY_5_SECONDS, { name: 'sync-runner-snapshots', waitForCompletion: true })
   @TrackJobExecution()
   @LogExecution('sync-runner-snapshots')
+  @WithInstrumentation()
   async syncRunnerSnapshots() {
     const lockKey = 'sync-runner-snapshots-lock'
     if (!(await this.redisLockProvider.lock(lockKey, 30))) {
@@ -112,6 +115,7 @@ export class SnapshotManager implements TrackableJobExecutions, OnApplicationShu
   @Cron(CronExpression.EVERY_10_SECONDS, { name: 'sync-runner-snapshot-states', waitForCompletion: true })
   @TrackJobExecution()
   @LogExecution('sync-runner-snapshot-states')
+  @WithInstrumentation()
   async syncRunnerSnapshotStates() {
     //  this approach is not ideal, as if the number of runners is large, this will take a long time
     //  also, if some snapshots stuck in a "pulling" state, they will infest the queue
@@ -353,6 +357,7 @@ export class SnapshotManager implements TrackableJobExecutions, OnApplicationShu
   @Cron(CronExpression.EVERY_10_SECONDS, { name: 'check-snapshot-cleanup' })
   @TrackJobExecution()
   @LogExecution('check-snapshot-cleanup')
+  @WithInstrumentation()
   async checkSnapshotCleanup() {
     const lockKey = 'check-snapshot-cleanup-lock'
     if (!(await this.redisLockProvider.lock(lockKey, 30))) {
@@ -397,6 +402,7 @@ export class SnapshotManager implements TrackableJobExecutions, OnApplicationShu
   @Cron(CronExpression.EVERY_10_SECONDS, { name: 'check-snapshot-state', waitForCompletion: true })
   @TrackJobExecution()
   @LogExecution('check-snapshot-state')
+  @WithInstrumentation()
   async checkSnapshotState() {
     //  the first time the snapshot is created it needs to be validated and pushed to the internal registry
     //  before propagating to the runners
@@ -598,7 +604,7 @@ export class SnapshotManager implements TrackableJobExecutions, OnApplicationShu
 
       // save snapshotRunner
 
-      const internalSnapshotName = `${registry.url}/${registry.project}/${snapshot.buildInfo.snapshotRef}`
+      const internalSnapshotName = `${registry.url.replace(/^(https?:\/\/)/, '')}/${registry.project}/${snapshot.buildInfo.snapshotRef}`
 
       snapshot.internalName = internalSnapshotName
       await this.snapshotRepository.save(snapshot)
@@ -676,7 +682,7 @@ export class SnapshotManager implements TrackableJobExecutions, OnApplicationShu
       await this.updateSnapshotState(
         snapshot.id,
         SnapshotState.ERROR,
-        `Snapshot size (${snapshotInfo.sizeGB.toFixed(2)}GB) exceeds maximum allowed size of ${MAX_SIZE_GB}GB`,
+        `Snapshot size (${snapshotInfo.sizeGB.toFixed(2)}GB) exceeds maximum allowed size of ${MAX_SIZE_GB}GB.\n${PER_SANDBOX_LIMIT_MESSAGE}`,
       )
       return
     }
@@ -863,6 +869,7 @@ export class SnapshotManager implements TrackableJobExecutions, OnApplicationShu
   @Cron(CronExpression.EVERY_HOUR, { name: 'cleanup-old-buildinfo-snapshot-runners' })
   @TrackJobExecution()
   @LogExecution('cleanup-old-buildinfo-snapshot-runners')
+  @WithInstrumentation()
   async cleanupOldBuildInfoSnapshotRunners() {
     const lockKey = 'cleanup-old-buildinfo-snapshots-lock'
     if (!(await this.redisLockProvider.lock(lockKey, 300))) {
@@ -904,6 +911,7 @@ export class SnapshotManager implements TrackableJobExecutions, OnApplicationShu
   @Cron(CronExpression.EVERY_10_MINUTES, { name: 'deactivate-old-snapshots' })
   @TrackJobExecution()
   @LogExecution('deactivate-old-snapshots')
+  @WithInstrumentation()
   async deactivateOldSnapshots() {
     const lockKey = 'deactivate-old-snapshots-lock'
     if (!(await this.redisLockProvider.lock(lockKey, 300))) {
@@ -970,6 +978,7 @@ export class SnapshotManager implements TrackableJobExecutions, OnApplicationShu
   @Cron(CronExpression.EVERY_10_MINUTES, { name: 'cleanup-inactive-snapshots-from-runners' })
   @TrackJobExecution()
   @LogExecution('cleanup-inactive-snapshots-from-runners')
+  @WithInstrumentation()
   async cleanupInactiveSnapshotsFromRunners() {
     const lockKey = 'cleanup-inactive-snapshots-from-runners-lock'
     if (!(await this.redisLockProvider.lock(lockKey, 300))) {

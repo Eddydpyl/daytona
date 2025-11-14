@@ -4,7 +4,6 @@
  */
 
 import {
-  ToolboxApi,
   SandboxState,
   SandboxApi,
   Sandbox as SandboxDto,
@@ -17,12 +16,16 @@ import {
   SshAccessDto,
   SshAccessValidationDto,
 } from '@daytonaio/api-client'
+import { FileSystemApi, GitApi, ProcessApi, LspApi, InfoApi, ComputerUseApi } from '@daytonaio/toolbox-api-client'
 import { FileSystem } from './FileSystem'
 import { Git } from './Git'
 import { CodeRunParams, Process } from './Process'
 import { LspLanguageId, LspServer } from './LspServer'
-import { DaytonaError } from './errors/DaytonaError'
+import { DaytonaError, DaytonaNotFoundError } from './errors/DaytonaError'
 import { ComputerUse } from './ComputerUse'
+import { AxiosInstance } from 'axios'
+
+const TOOLBOX_URL_PLACEHOLDER = 'dtn-placeholder'
 
 /**
  * Interface defining methods that a code toolbox must implement
@@ -59,7 +62,6 @@ export interface SandboxCodeToolbox {
  * @property {number} [autoStopInterval] - Auto-stop interval in minutes
  * @property {number} [autoArchiveInterval] - Auto-archive interval in minutes
  * @property {number} [autoDeleteInterval] - Auto-delete interval in minutes
- * @property {string} [runnerDomain] - Domain name of the Sandbox runner
  * @property {Array<SandboxVolume>} [volumes] - Volumes attached to the Sandbox
  * @property {BuildInfo} [buildInfo] - Build information for the Sandbox if it was created from dynamic build
  * @property {string} [createdAt] - When the Sandbox was created
@@ -95,7 +97,6 @@ export class Sandbox implements SandboxDto {
   public autoStopInterval?: number
   public autoArchiveInterval?: number
   public autoDeleteInterval?: number
-  public runnerDomain?: string
   public volumes?: Array<SandboxVolume>
   public buildInfo?: BuildInfo
   public createdAt?: string
@@ -103,32 +104,53 @@ export class Sandbox implements SandboxDto {
   public networkBlockAll!: boolean
   public networkAllowList?: string
 
+  private infoApi: InfoApi
+
   /**
    * Creates a new Sandbox instance
    *
    * @param {SandboxDto} sandboxDto - The API Sandbox instance
    * @param {SandboxApi} sandboxApi - API client for Sandbox operations
-   * @param {ToolboxApi} toolboxApi - API client for toolbox operations
+   * @param {InfoApi} infoApi - API client for info operations
    * @param {SandboxCodeToolbox} codeToolbox - Language-specific toolbox implementation
    */
   constructor(
     sandboxDto: SandboxDto,
     private readonly clientConfig: Configuration,
+    private readonly axiosInstance: AxiosInstance,
     private readonly sandboxApi: SandboxApi,
-    private readonly toolboxApi: ToolboxApi,
     private readonly codeToolbox: SandboxCodeToolbox,
+    private readonly getToolboxBaseUrl: () => Promise<string>,
   ) {
     this.processSandboxDto(sandboxDto)
-    this.fs = new FileSystem(this.id, this.clientConfig, this.toolboxApi)
-    this.git = new Git(this.id, this.toolboxApi)
+
+    // Lazy load the base URL for the toolbox
+    this.axiosInstance.defaults.baseURL = TOOLBOX_URL_PLACEHOLDER
+    this.axiosInstance.interceptors.request.use(async (config) => {
+      if (this.axiosInstance.defaults.baseURL === TOOLBOX_URL_PLACEHOLDER) {
+        await this.ensureToolboxUrl()
+
+        config.baseURL = this.axiosInstance.defaults.baseURL
+      }
+      return config
+    })
+
+    // Initialize Services
+    this.fs = new FileSystem(
+      this.clientConfig,
+      new FileSystemApi(this.clientConfig, '', this.axiosInstance),
+      this.ensureToolboxUrl.bind(this),
+    )
+    this.git = new Git(new GitApi(this.clientConfig, '', this.axiosInstance))
     this.process = new Process(
-      this.id,
       this.clientConfig,
       this.codeToolbox,
-      this.toolboxApi,
-      async (port) => await this.getPreviewLink(port),
+      new ProcessApi(this.clientConfig, '', this.axiosInstance),
+      async () => (await this.getPreviewLink(1)).token,
+      this.ensureToolboxUrl.bind(this),
     )
-    this.computerUse = new ComputerUse(this.id, this.toolboxApi)
+    this.computerUse = new ComputerUse(new ComputerUseApi(this.clientConfig, '', this.axiosInstance))
+    this.infoApi = new InfoApi(this.clientConfig, '', this.axiosInstance)
   }
 
   /**
@@ -141,7 +163,7 @@ export class Sandbox implements SandboxDto {
    * console.log(`Sandbox user home: ${userHomeDir}`);
    */
   public async getUserHomeDir(): Promise<string | undefined> {
-    const response = await this.toolboxApi.getUserHomeDir(this.id)
+    const response = await this.infoApi.getUserHomeDir()
     return response.data.dir
   }
 
@@ -163,7 +185,7 @@ export class Sandbox implements SandboxDto {
    * console.log(`Sandbox working directory: ${workDir}`);
    */
   public async getWorkDir(): Promise<string | undefined> {
-    const response = await this.toolboxApi.getWorkDir(this.id)
+    const response = await this.infoApi.getWorkDir()
     return response.data.dir
   }
 
@@ -181,7 +203,11 @@ export class Sandbox implements SandboxDto {
    * const lsp = await sandbox.createLspServer('typescript', 'workspace/project');
    */
   public async createLspServer(languageId: LspLanguageId | string, pathToProject: string): Promise<LspServer> {
-    return new LspServer(languageId as LspLanguageId, pathToProject, this.toolboxApi, this.id)
+    return new LspServer(
+      languageId as LspLanguageId,
+      pathToProject,
+      new LspApi(this.clientConfig, '', this.axiosInstance),
+    )
   }
 
   /**
@@ -252,7 +278,7 @@ export class Sandbox implements SandboxDto {
     }
     const startTime = Date.now()
     await this.sandboxApi.stopSandbox(this.id, undefined, { timeout: timeout * 1000 })
-    await this.refreshData()
+    await this.refreshDataSafe()
     const timeElapsed = Date.now() - startTime
     await this.waitUntilStopped(timeout ? Math.max(0.001, timeout - timeElapsed / 1000) : timeout)
   }
@@ -263,7 +289,7 @@ export class Sandbox implements SandboxDto {
    */
   public async delete(timeout = 60): Promise<void> {
     await this.sandboxApi.deleteSandbox(this.id, undefined, { timeout: timeout * 1000 })
-    await this.refreshData()
+    this.refreshDataSafe()
   }
 
   /**
@@ -327,7 +353,7 @@ export class Sandbox implements SandboxDto {
 
     // Treat destroyed as stopped to cover ephemeral sandboxes that are automatically deleted after stopping
     while (this.state !== 'stopped' && this.state !== 'destroyed') {
-      await this.refreshData()
+      this.refreshDataSafe()
 
       // @ts-expect-error this.refreshData() can modify this.state so this check is fine
       if (this.state === 'stopped' || this.state === 'destroyed') {
@@ -523,13 +549,40 @@ export class Sandbox implements SandboxDto {
     this.autoStopInterval = sandboxDto.autoStopInterval
     this.autoArchiveInterval = sandboxDto.autoArchiveInterval
     this.autoDeleteInterval = sandboxDto.autoDeleteInterval
-    this.runnerDomain = sandboxDto.runnerDomain
     this.volumes = sandboxDto.volumes
     this.buildInfo = sandboxDto.buildInfo
     this.createdAt = sandboxDto.createdAt
     this.updatedAt = sandboxDto.updatedAt
     this.networkBlockAll = sandboxDto.networkBlockAll
     this.networkAllowList = sandboxDto.networkAllowList
+  }
+
+  /**
+   * Refreshes the Sandbox data from the API, but does not throw an error if the sandbox has been deleted.
+   * Instead, it sets the state to destroyed.
+   *
+   * @returns {Promise<void>}
+   */
+  private async refreshDataSafe(): Promise<void> {
+    try {
+      await this.refreshData()
+    } catch (error) {
+      if (error instanceof DaytonaNotFoundError) {
+        this.state = SandboxState.DESTROYED
+      }
+    }
+  }
+
+  private async ensureToolboxUrl(): Promise<void> {
+    if (this.axiosInstance.defaults.baseURL !== TOOLBOX_URL_PLACEHOLDER) {
+      return
+    }
+    this.axiosInstance.defaults.baseURL = await this.getToolboxBaseUrl()
+    if (!this.axiosInstance.defaults.baseURL.endsWith('/')) {
+      this.axiosInstance.defaults.baseURL += '/'
+    }
+    this.axiosInstance.defaults.baseURL += this.id
+    this.clientConfig.basePath = this.axiosInstance.defaults.baseURL
   }
 }
 

@@ -154,13 +154,6 @@ Represents a Daytona Sandbox.
     ```ts
     SandboxDto.public
     ```
-- `runnerDomain?` _string_ - Domain name of the Sandbox runner
-    
-    ##### Implementation of
-    
-    ```ts
-    SandboxDto.runnerDomain
-    ```
 - `snapshot?` _string_ - Daytona snapshot used to create the Sandbox
     
     ##### Implementation of
@@ -220,9 +213,10 @@ Represents a Daytona Sandbox.
 new Sandbox(
    sandboxDto: Sandbox, 
    clientConfig: Configuration, 
+   axiosInstance: AxiosInstance, 
    sandboxApi: SandboxApi, 
-   toolboxApi: ToolboxApi, 
-   codeToolbox: SandboxCodeToolbox): Sandbox
+   codeToolbox: SandboxCodeToolbox, 
+   getToolboxBaseUrl: () => Promise<string>): Sandbox
 ```
 
 Creates a new Sandbox instance
@@ -231,9 +225,10 @@ Creates a new Sandbox instance
 
 - `sandboxDto` _Sandbox_ - The API Sandbox instance
 - `clientConfig` _Configuration_
+- `axiosInstance` _AxiosInstance_
 - `sandboxApi` _SandboxApi_ - API client for Sandbox operations
-- `toolboxApi` _ToolboxApi_ - API client for toolbox operations
 - `codeToolbox` _SandboxCodeToolbox_ - Language-specific toolbox implementation
+- `getToolboxBaseUrl` _\(\) =\> Promise\<string\>_
 
 
 **Returns**:

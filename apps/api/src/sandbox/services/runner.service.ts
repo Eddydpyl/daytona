@@ -25,6 +25,7 @@ import { RunnerAdapterFactory, RunnerInfo } from '../runner-adapter/runnerAdapte
 import { RedisLockProvider } from '../common/redis-lock.provider'
 import { TypedConfigService } from '../../config/typed-config.service'
 import { LogExecution } from '../../common/decorators/log-execution.decorator'
+import { WithInstrumentation } from '../../common/decorators/otel.decorator'
 
 @Injectable()
 export class RunnerService {
@@ -121,6 +122,10 @@ export class RunnerService {
         : MoreThanOrEqual(this.configService.getOrThrow('runnerUsage.availabilityScoreThreshold')),
     }
 
+    const excludedRunnerIds = params.excludedRunnerIds?.length
+      ? params.excludedRunnerIds.filter((id) => !!id)
+      : undefined
+
     if (params.snapshotRef !== undefined) {
       const snapshotRunners = await this.snapshotRunnerRepository.find({
         where: {
@@ -131,8 +136,8 @@ export class RunnerService {
 
       let runnerIds = snapshotRunners.map((snapshotRunner) => snapshotRunner.runnerId)
 
-      if (params.excludedRunnerIds?.length) {
-        runnerIds = runnerIds.filter((id) => !params.excludedRunnerIds.includes(id))
+      if (excludedRunnerIds?.length) {
+        runnerIds = runnerIds.filter((id) => !excludedRunnerIds.includes(id))
       }
 
       if (!runnerIds.length) {
@@ -140,8 +145,8 @@ export class RunnerService {
       }
 
       runnerFilter.id = In(runnerIds)
-    } else if (params.excludedRunnerIds?.length) {
-      runnerFilter.id = Not(In(params.excludedRunnerIds))
+    } else if (excludedRunnerIds?.length) {
+      runnerFilter.id = Not(In(excludedRunnerIds))
     }
 
     if (params.region !== undefined) {
@@ -191,6 +196,7 @@ export class RunnerService {
 
   @Cron(CronExpression.EVERY_10_SECONDS, { name: 'check-runners', waitForCompletion: true })
   @LogExecution('check-runners')
+  @WithInstrumentation()
   private async handleCheckRunners() {
     const lockKey = 'check-runners'
     const hasLock = await this.redisLockProvider.lock(lockKey, 60)
@@ -266,8 +272,7 @@ export class RunnerService {
               } else if (e.name === 'AbortError') {
                 this.logger.error(`Runner ${runner.id} health check was aborted due to timeout`)
               } else {
-                this.logger.error(`Error checking runner ${runner.id}: ${e.message}`)
-                this.logger.error(e)
+                this.logger.error(`Error checking runner ${runner.id}`, e)
               }
 
               // If last attempt, mark as unresponsive
@@ -396,7 +401,7 @@ export class RunnerService {
   async getRunnersWithMultipleSnapshotsBuilding(maxSnapshotCount = 2): Promise<string[]> {
     const runners = await this.sandboxRepository
       .createQueryBuilder('sandbox')
-      .select('sandbox.runnerId')
+      .select('sandbox.runnerId', 'runnerId')
       .where('sandbox.state = :state', { state: SandboxState.BUILDING_SNAPSHOT })
       .andWhere('sandbox.buildInfoSnapshotRef IS NOT NULL')
       .groupBy('sandbox.runnerId')

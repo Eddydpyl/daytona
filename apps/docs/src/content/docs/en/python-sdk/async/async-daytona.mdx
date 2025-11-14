@@ -53,7 +53,7 @@ Initializes Daytona instance with optional configuration.
 If no config is provided, reads from environment variables:
 - `DAYTONA_API_KEY`: Required API key for authentication
 - `DAYTONA_API_URL`: Required api URL
-- `DAYTONA_TARGET`: Optional target environment (defaults to 'us')
+- `DAYTONA_TARGET`: Optional target environment (if not provided, default region for the organization is used)
 
 **Arguments**:
 
@@ -107,7 +107,7 @@ async def close()
 Close the HTTP session and clean up resources.
 
 This method should be called when you're done using the AsyncDaytona instance
-to properly close the underlying HTTP session and avoid resource leaks.
+to properly close the underlying HTTP sessions and avoid resource leaks.
 
 **Example**:
 
@@ -275,14 +275,14 @@ await daytona.delete(sandbox)  # Clean up when done
 
 ```python
 @intercept_errors(message_prefix="Failed to get sandbox: ")
-async def get(sandbox_id: str) -> AsyncSandbox
+async def get(sandbox_id_or_name: str) -> AsyncSandbox
 ```
 
-Gets a Sandbox by its ID.
+Gets a Sandbox by its ID or name.
 
 **Arguments**:
 
-- `sandbox_id` _str_ - The ID of the Sandbox to retrieve.
+- `sandbox_id_or_name` _str_ - The ID or name of the Sandbox to retrieve.
   
 
 **Returns**:
@@ -292,13 +292,13 @@ Gets a Sandbox by its ID.
 
 **Raises**:
 
-- `DaytonaError` - If sandbox_id is not provided.
+- `DaytonaError` - If sandbox_id_or_name is not provided.
   
 
 **Example**:
 
 ```python
-sandbox = await daytona.get("my-sandbox-id")
+sandbox = await daytona.get("my-sandbox-id-or-name")
 print(sandbox.state)
 ```
 
@@ -306,21 +306,21 @@ print(sandbox.state)
 
 ```python
 @intercept_errors(message_prefix="Failed to find sandbox: ")
-async def find_one(sandbox_id: Optional[str] = None,
+async def find_one(sandbox_id_or_name: Optional[str] = None,
                    labels: Optional[Dict[str, str]] = None) -> AsyncSandbox
 ```
 
-Finds a Sandbox by its ID or labels.
+Finds a Sandbox by its ID or name or labels.
 
 **Arguments**:
 
-- `sandbox_id` _Optional[str]_ - The ID of the Sandbox to retrieve.
+- `sandbox_id_or_name` _Optional[str]_ - The ID or name of the Sandbox to retrieve.
 - `labels` _Optional[Dict[str, str]]_ - Labels to filter Sandboxes.
   
 
 **Returns**:
 
-- `Sandbox` - First Sandbox that matches the ID or labels.
+- `Sandbox` - First Sandbox that matches the ID or name or labels.
   
 
 **Raises**:
@@ -439,8 +439,8 @@ Configuration options for initializing the Daytona client.
   here or in the environment variable `DAYTONA_API_URL`.
 - `server_url` _Optional[str]_ - Deprecated. Use `api_url` instead. This property will be removed
   in a future version.
-- `target` _Optional[str]_ - Target runner location for the Sandbox. Defaults to `'us'` if not set here
-  or in the environment variable `DAYTONA_TARGET`.
+- `target` _Optional[str]_ - Target runner location for the Sandbox. Default region for the organization is used 
+  if not set here or in the environment variable `DAYTONA_TARGET`.
   
 
 **Example**:

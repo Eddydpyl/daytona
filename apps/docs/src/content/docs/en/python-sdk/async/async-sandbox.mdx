@@ -37,7 +37,6 @@ Represents a Daytona Sandbox.
 - `auto_stop_interval` _int_ - Auto-stop interval in minutes.
 - `auto_archive_interval` _int_ - Auto-archive interval in minutes.
 - `auto_delete_interval` _int_ - Auto-delete interval in minutes.
-- `runner_domain` _str_ - Domain name of the Sandbox runner.
 - `volumes` _List[str]_ - Volumes attached to the Sandbox.
 - `build_info` _str_ - Build information for the Sandbox if it was created from dynamic build.
 - `created_at` _str_ - When the Sandbox was created.
@@ -48,23 +47,25 @@ Represents a Daytona Sandbox.
 #### AsyncSandbox.\_\_init\_\_
 
 ```python
-def __init__(sandbox_dto: SandboxDto, sandbox_api: SandboxApi,
-             toolbox_api: ToolboxApi, code_toolbox: SandboxCodeToolbox)
+def __init__(sandbox_dto: SandboxDto, toolbox_api: ApiClient,
+             sandbox_api: SandboxApi, code_toolbox: SandboxCodeToolbox,
+             get_toolbox_base_url: Callable[[], Awaitable[str]])
 ```
 
 Initialize a new Sandbox instance.
 
 **Arguments**:
 
-- `id` _str_ - Unique identifier for the Sandbox.
-- `instance` _SandboxInstance_ - The underlying Sandbox instance.
+- `sandbox_dto` _SandboxDto_ - The sandbox data from the API.
+- `toolbox_api` _ApiClient_ - API client for toolbox operations.
 - `sandbox_api` _SandboxApi_ - API client for Sandbox operations.
-- `toolbox_api` _ToolboxApi_ - API client for toolbox operations.
 - `code_toolbox` _SandboxCodeToolbox_ - Language-specific toolbox implementation.
+- `get_toolbox_base_url` _Callable[[], Awaitable[str]]_ - Function to get the toolbox base URL.
 
 #### AsyncSandbox.refresh\_data
 
 ```python
+@intercept_errors(message_prefix="Failed to refresh sandbox data: ")
 async def refresh_data() -> None
 ```
 

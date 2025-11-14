@@ -18,7 +18,6 @@ import { SandboxState } from '../enums/sandbox-state.enum'
 import { SandboxDesiredState } from '../enums/sandbox-desired-state.enum'
 import { SandboxClass } from '../enums/sandbox-class.enum'
 import { BackupState } from '../enums/backup-state.enum'
-import { nanoid } from 'nanoid'
 import { v4 as uuidv4 } from 'uuid'
 import { SandboxVolume } from '../dto/sandbox.dto'
 import { BuildInfo } from './build-info.entity'
@@ -37,9 +36,7 @@ export class Sandbox {
   @Column()
   name: string
 
-  @Column({
-    default: 'us',
-  })
+  @Column()
   region: string
 
   @Column({
@@ -197,10 +194,11 @@ export class Sandbox {
   @Column({ nullable: true })
   daemonVersion?: string
 
-  constructor(name?: string) {
+  constructor(region: string, name?: string) {
     this.id = uuidv4()
     // Set name - use provided name or fallback to ID
     this.name = name || this.id
+    this.region = region
   }
 
   public setBackupState(
@@ -242,13 +240,6 @@ export class Sandbox {
     }
     if (backupErrorReason !== undefined) {
       this.backupErrorReason = backupErrorReason
-    }
-  }
-
-  @BeforeUpdate()
-  updateAccessToken() {
-    if (this.state === SandboxState.STARTED) {
-      this.authToken = nanoid(32).toLocaleLowerCase()
     }
   }
 
@@ -328,10 +319,17 @@ export class Sandbox {
 
   @BeforeUpdate()
   updatePendingFlag() {
-    if (String(this.state) === String(this.desiredState)) {
+    if (!this.pending && String(this.state) !== String(this.desiredState)) {
+      this.pending = true
+    }
+    if (this.pending && String(this.state) === String(this.desiredState)) {
       this.pending = false
     }
-    if (this.state === SandboxState.ERROR || this.state === SandboxState.BUILD_FAILED) {
+    if (
+      this.state === SandboxState.ERROR ||
+      this.state === SandboxState.BUILD_FAILED ||
+      this.desiredState === SandboxDesiredState.ARCHIVED
+    ) {
       this.pending = false
     }
   }

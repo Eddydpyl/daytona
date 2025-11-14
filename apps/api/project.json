@@ -35,7 +35,11 @@
     "openapi": {
       "executor": "nx:run-commands",
       "options": {
-        "command": "yarn ts-node apps/api/src/generate-openapi.ts -o dist/apps/api/openapi.json",
+        "commands": [
+          "mkdir -p dist/apps/api",
+          "yarn ts-node apps/api/src/generate-openapi.ts -o dist/apps/api/openapi.json"
+        ],
+        "parallel": false,
         "env": {
           "TS_NODE_PROJECT": "apps/api/tsconfig.app.json",
           "NODE_OPTIONS": "--require tsconfig-paths/register",
@@ -76,7 +80,13 @@
     "docker": {
       "options": {
         "target": "daytona"
-      }
+      },
+      "dependsOn": [
+        {
+          "target": "build-amd64",
+          "projects": "runner"
+        }
+      ]
     },
     "push-manifest": {},
     "migration:generate": {

@@ -69,7 +69,7 @@ func PreviewLink(ctx context.Context, request mcp.CallToolRequest, args PreviewL
 		log.Infof("Checking if server is running - port: %d", *args.Port)
 
 		checkCmd := fmt.Sprintf("curl -s -o /dev/null -w '%%{http_code}' http://localhost:%d --max-time 2 || echo 'error'", *args.Port)
-		result, _, err := apiClient.ToolboxAPI.ExecuteCommand(ctx, *args.Id).ExecuteRequest(*apiclient.NewExecuteRequest(checkCmd)).Execute()
+		result, _, err := apiClient.ToolboxAPI.ExecuteCommandDeprecated(ctx, *args.Id).ExecuteRequest(*apiclient.NewExecuteRequest(checkCmd)).Execute()
 		if err != nil {
 			return &mcp.CallToolResult{IsError: true}, fmt.Errorf("error checking server: %v", err)
 		}
@@ -80,7 +80,7 @@ func PreviewLink(ctx context.Context, request mcp.CallToolRequest, args PreviewL
 
 			// Check what might be using the port
 			psCmd := fmt.Sprintf("ps aux | grep ':%d' | grep -v grep || echo 'No process found'", *args.Port)
-			psResult, _, err := apiClient.ToolboxAPI.ExecuteCommand(ctx, *args.Id).ExecuteRequest(*apiclient.NewExecuteRequest(psCmd)).Execute()
+			psResult, _, err := apiClient.ToolboxAPI.ExecuteCommandDeprecated(ctx, *args.Id).ExecuteRequest(*apiclient.NewExecuteRequest(psCmd)).Execute()
 			if err != nil {
 				return &mcp.CallToolResult{IsError: true}, fmt.Errorf("error checking processes: %v", err)
 			}
@@ -89,20 +89,18 @@ func PreviewLink(ctx context.Context, request mcp.CallToolRequest, args PreviewL
 		}
 	}
 
-	var runnerDomain string
-	if sandbox.RunnerDomain != nil {
-		runnerDomain = *sandbox.RunnerDomain
+	// Fetch preview URL
+	previewURL, _, err := apiClient.SandboxAPI.GetPortPreviewUrl(ctx, *args.Id, float32(*args.Port)).Execute()
+	if err != nil {
+		return &mcp.CallToolResult{IsError: true}, fmt.Errorf("failed to get preview URL: %v", err)
 	}
-
-	// Format preview URL
-	previewURL := fmt.Sprintf("http://%d-%s.%s", *args.Port, *args.Id, runnerDomain)
 
 	// Test URL accessibility if requested
 	var accessible bool
 	var statusCode string
 	if checkServer {
-		checkCmd := fmt.Sprintf("curl -s -o /dev/null -w '%%{http_code}' %s --max-time 3 || echo 'error'", previewURL)
-		result, _, err := apiClient.ToolboxAPI.ExecuteCommand(ctx, *args.Id).ExecuteRequest(*apiclient.NewExecuteRequest(checkCmd)).Execute()
+		checkCmd := fmt.Sprintf("curl -s -o /dev/null -w '%%{http_code}' %s --max-time 3 || echo 'error'", previewURL.Url)
+		result, _, err := apiClient.ToolboxAPI.ExecuteCommandDeprecated(ctx, *args.Id).ExecuteRequest(*apiclient.NewExecuteRequest(checkCmd)).Execute()
 		if err != nil {
 			log.Errorf("Error checking preview URL: %v", err)
 		} else {
@@ -114,9 +112,9 @@ func PreviewLink(ctx context.Context, request mcp.CallToolRequest, args PreviewL
 		}
 	}
 
-	log.Infof("Preview link generated: %s", previewURL)
+	log.Infof("Preview link generated: %s", previewURL.Url)
 	log.Infof("Accessible: %t", accessible)
 	log.Infof("Status code: %s", statusCode)
 
-	return mcp.NewToolResultText(fmt.Sprintf("Preview link generated: %s", previewURL)), nil
+	return mcp.NewToolResultText(fmt.Sprintf("Preview link generated: %s", previewURL.Url)), nil
 }

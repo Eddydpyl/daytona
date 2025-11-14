@@ -3,18 +3,28 @@
 
 import asyncio
 import time
-from typing import Dict, List, Optional
+from types import MethodType
+from typing import Awaitable, Callable, Dict, List, Optional
 
 from daytona_api_client_async import PaginatedSandboxes as PaginatedSandboxesDto
 from daytona_api_client_async import PortPreviewUrl
 from daytona_api_client_async import Sandbox as SandboxDto
-from daytona_api_client_async import SandboxApi, SshAccessDto, SshAccessValidationDto, ToolboxApi
+from daytona_api_client_async import SandboxApi, SandboxState, SshAccessDto, SshAccessValidationDto
+from daytona_toolbox_api_client_async import (
+    ApiClient,
+    ComputerUseApi,
+    FileSystemApi,
+    GitApi,
+    InfoApi,
+    LspApi,
+    ProcessApi,
+)
 from deprecated import deprecated
 from pydantic import ConfigDict, PrivateAttr
 
 from .._utils.errors import intercept_errors
 from .._utils.timeout import with_timeout
-from ..common.errors import DaytonaError
+from ..common.errors import DaytonaError, DaytonaNotFoundError
 from ..common.protocols import SandboxCodeToolbox
 from .computer_use import AsyncComputerUse
 from .filesystem import AsyncFileSystem
@@ -51,7 +61,6 @@ class AsyncSandbox(SandboxDto):
         auto_stop_interval (int): Auto-stop interval in minutes.
         auto_archive_interval (int): Auto-archive interval in minutes.
         auto_delete_interval (int): Auto-delete interval in minutes.
-        runner_domain (str): Domain name of the Sandbox runner.
         volumes (List[str]): Volumes attached to the Sandbox.
         build_info (str): Build information for the Sandbox if it was created from dynamic build.
         created_at (str): When the Sandbox was created.
@@ -71,29 +80,49 @@ class AsyncSandbox(SandboxDto):
     def __init__(
         self,
         sandbox_dto: SandboxDto,
+        toolbox_api: ApiClient,
         sandbox_api: SandboxApi,
-        toolbox_api: ToolboxApi,
         code_toolbox: SandboxCodeToolbox,
+        get_toolbox_base_url: Callable[[], Awaitable[str]],
     ):
         """Initialize a new Sandbox instance.
 
         Args:
-            id (str): Unique identifier for the Sandbox.
-            instance (SandboxInstance): The underlying Sandbox instance.
+            sandbox_dto (SandboxDto): The sandbox data from the API.
+            toolbox_api (ApiClient): API client for toolbox operations.
             sandbox_api (SandboxApi): API client for Sandbox operations.
-            toolbox_api (ToolboxApi): API client for toolbox operations.
             code_toolbox (SandboxCodeToolbox): Language-specific toolbox implementation.
+            get_toolbox_base_url (Callable[[], Awaitable[str]]): Function to get the toolbox base URL.
         """
         super().__init__(**sandbox_dto.model_dump())
         self.__process_sandbox_dto(sandbox_dto)
         self._sandbox_api = sandbox_api
-        self._toolbox_api = toolbox_api
         self._code_toolbox = code_toolbox
+        self._toolbox_api = toolbox_api
+        self._toolbox_api.configuration.host = ""
+        self._get_toolbox_base_url = get_toolbox_base_url
 
-        self._fs = AsyncFileSystem(self.id, toolbox_api)
-        self._git = AsyncGit(self.id, toolbox_api)
-        self._process = AsyncProcess(self.id, code_toolbox, toolbox_api, self.get_preview_link)
-        self._computer_use = AsyncComputerUse(self.id, toolbox_api)
+        self._fs = AsyncFileSystem(FileSystemApi(toolbox_api), self.__ensure_toolbox_url)
+        self._git = AsyncGit(GitApi(toolbox_api))
+        self._process = AsyncProcess(code_toolbox, ProcessApi(toolbox_api), self.__ensure_toolbox_url)
+        self._computer_use = AsyncComputerUse(ComputerUseApi(toolbox_api))
+        self._info_api = InfoApi(toolbox_api)
+
+        og_call_toolbox_api = self._toolbox_api.call_api
+
+        async def call_toolbox_api_with_lazy_host_load(_, *args, **kwargs):
+            url = str(args[1])
+            if url.startswith("/"):
+                await self.__ensure_toolbox_url()
+                url = self._toolbox_api.configuration.host + url
+                args = (args[0], url, *args[2:])
+
+            return await og_call_toolbox_api(*args, **kwargs)
+
+        self._toolbox_api.call_api = MethodType(
+            call_toolbox_api_with_lazy_host_load,
+            self._toolbox_api,
+        )
 
     @property
     def fs(self) -> AsyncFileSystem:
@@ -111,6 +140,7 @@ class AsyncSandbox(SandboxDto):
     def computer_use(self) -> AsyncComputerUse:
         return self._computer_use
 
+    @intercept_errors(message_prefix="Failed to refresh sandbox data: ")
     async def refresh_data(self) -> None:
         """Refreshes the Sandbox data from the API.
 
@@ -138,7 +168,7 @@ class AsyncSandbox(SandboxDto):
             print(f"Sandbox user home: {user_home_dir}")
             ```
         """
-        response = await self._toolbox_api.get_user_home_dir(self.id)
+        response = await self._info_api.get_user_home_dir()
         return response.dir
 
     @deprecated(
@@ -163,7 +193,7 @@ class AsyncSandbox(SandboxDto):
             print(f"Sandbox working directory: {work_dir}")
             ```
         """
-        response = await self._toolbox_api.get_work_dir(self.id)
+        response = await self._info_api.get_work_dir()
         return response.dir
 
     def create_lsp_server(self, language_id: LspLanguageId, path_to_project: str) -> AsyncLspServer:
@@ -188,8 +218,7 @@ class AsyncSandbox(SandboxDto):
         return AsyncLspServer(
             language_id,
             path_to_project,
-            self._toolbox_api,
-            self.id,
+            LspApi(self._toolbox_api),
         )
 
     @intercept_errors(message_prefix="Failed to set labels: ")
@@ -272,7 +301,7 @@ class AsyncSandbox(SandboxDto):
         """
         start_time = time.time()
         await self._sandbox_api.stop_sandbox(self.id, _request_timeout=timeout or None)
-        await self.refresh_data()
+        await self.__refresh_data_safe()
         time_elapsed = time.time() - start_time
         await self.wait_for_sandbox_stop(timeout=max(0.001, timeout - time_elapsed) if timeout else timeout)
 
@@ -285,7 +314,7 @@ class AsyncSandbox(SandboxDto):
                 Default is 60 seconds.
         """
         await self._sandbox_api.delete_sandbox(self.id, _request_timeout=timeout or None)
-        await self.refresh_data()
+        await self.__refresh_data_safe()
 
     @intercept_errors(message_prefix="Failure during waiting for sandbox to start: ")
     @with_timeout(
@@ -343,7 +372,7 @@ class AsyncSandbox(SandboxDto):
         """
         while self.state not in ["stopped", "destroyed"]:
             try:
-                await self.refresh_data()
+                await self.__refresh_data_safe()
 
                 if self.state in ["error", "build_failed"]:
                     err_msg = (
@@ -517,13 +546,30 @@ class AsyncSandbox(SandboxDto):
         self.auto_stop_interval = sandbox_dto.auto_stop_interval
         self.auto_archive_interval = sandbox_dto.auto_archive_interval
         self.auto_delete_interval = sandbox_dto.auto_delete_interval
-        self.runner_domain = sandbox_dto.runner_domain
         self.volumes = sandbox_dto.volumes
         self.build_info = sandbox_dto.build_info
         self.created_at = sandbox_dto.created_at
         self.updated_at = sandbox_dto.updated_at
         self.network_block_all = sandbox_dto.network_block_all
         self.network_allow_list = sandbox_dto.network_allow_list
+
+    async def __refresh_data_safe(self) -> None:
+        """Refreshes the Sandbox data from the API, but does not throw an error if the sandbox has been deleted.
+        Instead, it sets the state to destroyed.
+        """
+        try:
+            await self.refresh_data()
+        except DaytonaNotFoundError:
+            self.state = SandboxState.DESTROYED
+
+    async def __ensure_toolbox_url(self) -> None:
+        """Ensures the toolbox API URL for the sandbox is initialized."""
+        if self._toolbox_api.configuration.host != "":
+            return
+        self._toolbox_api.configuration.host = await self._get_toolbox_base_url()
+        if not self._toolbox_api.configuration.host.endswith("/"):
+            self._toolbox_api.configuration.host += "/"
+        self._toolbox_api.configuration.host += self.id
 
 
 class AsyncPaginatedSandboxes(PaginatedSandboxesDto):

@@ -19,6 +19,8 @@ RUN yarn nx build proxy --configuration=production --nxBail=true
 
 FROM alpine:3.18 AS proxy
 
+RUN apk add --no-cache curl
+
 WORKDIR /usr/local/bin
 
 COPY --from=build /daytona/dist/apps/proxy daytona-proxy
@@ -40,5 +42,9 @@ ENV OIDC_AUDIENCE=daytona
 
 ENV REDIS_HOST=redis
 ENV REDIS_PORT=6379
+
+ENV TOOLBOX_ONLY_MODE=false
+
+HEALTHCHECK CMD [ "curl", "-f", "http://localhost:4000/health" ]
 
 ENTRYPOINT ["daytona-proxy"]

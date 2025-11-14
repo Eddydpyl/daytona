@@ -11,13 +11,17 @@ import {
   ReplaceRequest,
   ReplaceResult,
   SearchFilesResponse,
-  ToolboxApi,
-} from '@daytonaio/api-client'
+} from '@daytonaio/toolbox-api-client'
 import FormData from 'form-data'
+import { FileSystemApi } from '@daytonaio/toolbox-api-client'
 import { dynamicImport } from './utils/Import'
 import { RUNTIME, Runtime } from './utils/Runtime'
-import busboy from 'busboy'
 import { DaytonaError } from './errors/DaytonaError'
+import {
+  normalizeResponseStream,
+  processDownloadFilesResponseWithBusboy,
+  processDownloadFilesResponseWithBuffered,
+} from './utils/FileTransfer'
 
 /**
  * Parameters for setting file permissions in the Sandbox.
@@ -65,7 +69,7 @@ export interface FileUpload {
  * @property {string} [destination] - Destination path in the local filesystem where the file content will be
  * streamed to. If not provided, the file will be downloaded in the bytes buffer (might cause memory issues if the file is large).
  */
-interface FileDownloadRequest {
+export interface FileDownloadRequest {
   source: string
   destination?: string
 }
@@ -79,10 +83,25 @@ interface FileDownloadRequest {
  * or bytes content (if no destination in the request), undefined if failed or no data received.
  * @property {string | undefined} [error] - Error message if the download failed, undefined if successful.
  */
-interface FileDownloadResponse {
+export interface FileDownloadResponse {
   source: string
   result?: Buffer | string
   error?: string
+}
+
+/**
+ * Represents metadata for a file download operation.
+ *
+ * @interface
+ * @property {string | undefined} [destination] - Destination path in the local filesystem where the file content will be streamed to.
+ * @property {string | undefined} [error] - Error message if the download failed, undefined if successful.
+ * @property {Buffer | string | Uint8Array | undefined} [result] - The download result - file path (if destination provided in the request)
+ * or bytes content (if no destination in the request), undefined if failed or no data received.
+ */
+export interface DownloadMetadata {
+  destination?: string
+  error?: string
+  result?: Buffer | string | Uint8Array
 }
 
 /**
@@ -92,9 +111,9 @@ interface FileDownloadResponse {
  */
 export class FileSystem {
   constructor(
-    private readonly sandboxId: string,
     private readonly clientConfig: Configuration,
-    private readonly toolboxApi: ToolboxApi,
+    private readonly apiClient: FileSystemApi,
+    private readonly ensureToolboxUrl: () => Promise<void>,
   ) {}
 
   /**
@@ -109,7 +128,7 @@ export class FileSystem {
    * await fs.createFolder('app/data', '755');
    */
   public async createFolder(path: string, mode: string): Promise<void> {
-    const response = await this.toolboxApi.createFolder(this.sandboxId, path, mode)
+    const response = await this.apiClient.createFolder(path, mode)
     return response.data
   }
 
@@ -125,7 +144,7 @@ export class FileSystem {
    * await fs.deleteFile('app/temp.log');
    */
   public async deleteFile(path: string, recursive?: boolean): Promise<void> {
-    const response = await this.toolboxApi.deleteFile(this.sandboxId, path, undefined, recursive)
+    const response = await this.apiClient.deleteFile(path, recursive)
     return response.data
   }
 
@@ -214,134 +233,46 @@ export class FileSystem {
   ): Promise<FileDownloadResponse[]> {
     if (files.length === 0) return []
 
-    const srcFileMetaMap = new Map<string, { dst?: string; error?: string; result?: Buffer | string }>()
-    const fileTasks: Promise<void>[] = []
+    const isNonStreamingRuntime = RUNTIME === Runtime.BROWSER || RUNTIME === Runtime.SERVERLESS
+
+    // Prepare destinations and metadata
+    const metadataMap = new Map<string, DownloadMetadata>()
 
     for (const f of files) {
-      srcFileMetaMap.set(f.source, { dst: f.destination })
+      metadataMap.set(f.source, { destination: f.destination })
       if (f.destination) {
         const fs = await dynamicImport('fs', 'Downloading files to local files is not supported: ')
         await fs.promises.mkdir(pathe.dirname(f.destination), { recursive: true })
       }
     }
 
-    const response = await this.toolboxApi.downloadFiles(
-      this.sandboxId,
-      { paths: Array.from(srcFileMetaMap.keys()) },
-      undefined,
+    const response = await this.apiClient.downloadFiles(
+      { paths: files.map((f) => f.source) },
       {
-        responseType: 'stream',
+        responseType: isNonStreamingRuntime ? 'arraybuffer' : 'stream',
         timeout: timeoutSec * 1000,
       },
     )
-    const responseData = response.data as any
 
-    await new Promise<void>((resolve, reject) => {
-      const bb = busboy({
-        headers: response.headers as Record<string, string>,
-        preservePath: true,
-      })
+    const stream = normalizeResponseStream(response.data)
 
-      bb.on('file', (partType, fileStream, fileInfo) => {
-        const source = fileInfo.filename
-
-        if (!source) {
-          // Unexpected file from upstream, reject the request
-          responseData.destroy()
-          reject(new DaytonaError(`Received unexpected file "${fileInfo.filename}".`))
-          return
-        }
-
-        const meta = srcFileMetaMap.get(source)
-        if (!meta) {
-          responseData.destroy()
-          reject(new DaytonaError(`Target metadata missing for valid source: ${source}`))
-          return
-        }
-
-        if (partType === 'error') {
-          let buf = Buffer.alloc(0)
-          fileStream.on('data', (chunk) => {
-            buf = Buffer.concat([buf, chunk])
-          })
-          fileStream.on('end', () => {
-            meta.error = buf.toString('utf-8').trim()
-          })
-          fileStream.on('error', (err) => {
-            meta.error = `Stream error: ${err.message}`
-          })
-        } else if (partType === 'file') {
-          if (meta.dst) {
-            fileTasks.push(
-              new Promise((resolve) => {
-                dynamicImport('fs', 'Downloading files to local files is not supported: ').then((fs) => {
-                  const writeStream = fs.createWriteStream(meta.dst!, { autoClose: true })
-                  fileStream.pipe(writeStream)
-                  writeStream.on('finish', () => {
-                    meta.result = meta.dst
-                    resolve()
-                  })
-                  writeStream.on('error', (err) => {
-                    meta.error = `Write stream failed: ${err.message}`
-                    resolve()
-                  })
-                  fileStream.on('error', (err) => {
-                    meta.error = `Read stream failed: ${err.message}`
-                  })
-                })
-              }),
-            )
-          } else {
-            const chunks: Buffer[] = []
-            fileStream.on('data', (chunk) => {
-              chunks.push(chunk)
-            })
-            fileStream.on('end', () => {
-              meta.result = Buffer.concat(chunks)
-            })
-            fileStream.on('error', (err) => {
-              meta.error = `Read failed: ${err.message}`
-            })
-          }
-        } else {
-          fileStream.resume()
-        }
-      })
-
-      bb.on('error', (err) => {
-        responseData.destroy()
-        reject(err)
-      })
-
-      bb.on('finish', resolve)
-      responseData.pipe(bb)
-    })
-    await Promise.all(fileTasks)
-
-    const results: FileDownloadResponse[] = []
-
-    for (const f of files) {
-      const meta = srcFileMetaMap.get(f.source)
-      let err = meta?.error
-      if (!err && !meta?.result) {
-        err = 'No data received for this file'
-      }
-      let res: Buffer | string | undefined
-
-      if (!err && meta) {
-        res = meta.result
-      } else if (!meta) {
-        err = 'No writer metadata found'
-      }
-
-      results.push({
-        source: f.source,
-        result: res,
-        error: err,
-      })
+    // Node.js path: use busboy for efficient streaming
+    if (isNonStreamingRuntime) {
+      await processDownloadFilesResponseWithBuffered(stream, response.headers as Record<string, string>, metadataMap)
+    } else {
+      await processDownloadFilesResponseWithBusboy(stream, response.headers as Record<string, string>, metadataMap)
     }
 
-    return results
+    return files.map((f) => {
+      const metadata = metadataMap.get(f.source)
+      const error = metadata?.error || (!metadata?.result ? 'No data received for this file' : undefined)
+
+      return {
+        source: f.source,
+        result: error ? undefined : (metadata!.result as Buffer | string),
+        error,
+      }
+    })
   }
 
   /**
@@ -359,7 +290,7 @@ export class FileSystem {
    * });
    */
   public async findFiles(path: string, pattern: string): Promise<Array<Match>> {
-    const response = await this.toolboxApi.findInFiles(this.sandboxId, path, pattern)
+    const response = await this.apiClient.findInFiles(path, pattern)
     return response.data
   }
 
@@ -375,7 +306,7 @@ export class FileSystem {
    * console.log(`Size: ${info.size}, Modified: ${info.modTime}`);
    */
   public async getFileDetails(path: string): Promise<FileInfo> {
-    const response = await this.toolboxApi.getFileInfo(this.sandboxId, path)
+    const response = await this.apiClient.getFileInfo(path)
     return response.data
   }
 
@@ -393,7 +324,7 @@ export class FileSystem {
    * });
    */
   public async listFiles(path: string): Promise<FileInfo[]> {
-    const response = await this.toolboxApi.listFiles(this.sandboxId, undefined, path)
+    const response = await this.apiClient.listFiles(path)
     return response.data
   }
 
@@ -409,7 +340,7 @@ export class FileSystem {
    * await fs.moveFiles('app/temp/data.json', 'app/data/data.json');
    */
   public async moveFiles(source: string, destination: string): Promise<void> {
-    const response = await this.toolboxApi.moveFile(this.sandboxId, source, destination)
+    const response = await this.apiClient.moveFile(source, destination)
     return response.data
   }
 
@@ -436,7 +367,7 @@ export class FileSystem {
       pattern,
     }
 
-    const response = await this.toolboxApi.replaceInFiles(this.sandboxId, replaceRequest)
+    const response = await this.apiClient.replaceInFiles(replaceRequest)
     return response.data
   }
 
@@ -453,7 +384,7 @@ export class FileSystem {
    * result.files.forEach(file => console.log(file));
    */
   public async searchFiles(path: string, pattern: string): Promise<SearchFilesResponse> {
-    const response = await this.toolboxApi.searchFiles(this.sandboxId, path, pattern)
+    const response = await this.apiClient.searchFiles(path, pattern)
     return response.data
   }
 
@@ -473,10 +404,8 @@ export class FileSystem {
    * });
    */
   public async setFilePermissions(path: string, permissions: FilePermissionsParams): Promise<void> {
-    const response = await this.toolboxApi.setFilePermissions(
-      this.sandboxId,
+    const response = await this.apiClient.setFilePermissions(
       path,
-      undefined,
       permissions.owner!,
       permissions.group!,
       permissions.mode!,
@@ -546,22 +475,23 @@ export class FileSystem {
    * await fs.uploadFiles(files);
    */
   public async uploadFiles(files: FileUpload[], timeout: number = 30 * 60): Promise<void> {
+    const isNonStreamingRuntime =
+      RUNTIME === Runtime.DENO || RUNTIME === Runtime.BROWSER || RUNTIME === Runtime.SERVERLESS
     // Use native FormData in Deno
-    const FormDataClass =
-      RUNTIME === Runtime.DENO || RUNTIME === Runtime.SERVERLESS
-        ? FormData
-        : ((await dynamicImport('form-data', 'Uploading files is not supported: ')) as any)
+    const FormDataClass = isNonStreamingRuntime
+      ? FormData
+      : ((await dynamicImport('form-data', 'Uploading files is not supported: ')) as any)
     const form = new FormDataClass()
 
     for (const [i, { source, destination }] of files.entries()) {
       form.append(`files[${i}].path`, destination)
       const payload = await this.makeFilePayload(source)
-      // the third arg sets filename in Content-Disposition
       form.append(`files[${i}].file`, payload as any, destination)
     }
 
-    if (RUNTIME === Runtime.SERVERLESS) {
-      const url = `${this.clientConfig.basePath}/toolbox/${this.sandboxId}/toolbox/files/bulk-upload`
+    if (isNonStreamingRuntime) {
+      await this.ensureToolboxUrl()
+      const url = `${this.clientConfig.basePath}/files/bulk-upload`
       await fetch(url, {
         method: 'POST',
         headers: this.clientConfig.baseOptions.headers,
@@ -569,7 +499,7 @@ export class FileSystem {
         signal: timeout ? AbortSignal.timeout(timeout * 1000) : undefined,
       })
     } else {
-      await this.toolboxApi.uploadFiles(this.sandboxId, undefined, {
+      await this.apiClient.uploadFiles({
         data: form,
         maxRedirects: 0,
         timeout: timeout * 1000,
@@ -578,18 +508,19 @@ export class FileSystem {
   }
 
   private async makeFilePayload(source: Uint8Array | string) {
-    // 1) file‐path
+    // String = file path
     if (typeof source === 'string') {
       const fs = await dynamicImport('fs', 'Uploading file from local file system is not supported: ')
       return fs.createReadStream(source)
     }
 
-    // 2) browser → Blob
-    if (RUNTIME === Runtime.BROWSER || RUNTIME === Runtime.SERVERLESS) {
-      return new Blob([source], { type: 'application/octet-stream' })
+    // Blob
+    if (RUNTIME === Runtime.BROWSER || RUNTIME === Runtime.SERVERLESS || RUNTIME === Runtime.DENO) {
+      // Use .slice() to ensure we have a concrete ArrayBuffer, not ArrayBufferLike
+      return new Blob([source.slice()], { type: 'application/octet-stream' })
     }
 
-    // 3) Node (or other server runtimes) → stream.Readable
+    // Readable stream
     const stream = await dynamicImport('stream', 'Uploading file is not supported: ')
     return stream.Readable.from(source)
   }

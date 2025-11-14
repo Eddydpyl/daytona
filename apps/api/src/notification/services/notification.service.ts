@@ -22,10 +22,6 @@ import { VolumeDto } from '../../sandbox/dto/volume.dto'
 import { VolumeStateUpdatedEvent } from '../../sandbox/events/volume-state-updated.event'
 import { VolumeLastUsedAtUpdatedEvent } from '../../sandbox/events/volume-last-used-at-updated.event'
 import { SandboxDesiredStateUpdatedEvent } from '../../sandbox/events/sandbox-desired-state-updated.event'
-import { AuditLogEvents } from '../../audit/constants/audit-log-events.constant'
-import { AuditLogDto } from '../../audit/dto/audit-log.dto'
-import { AuditLogCreatedEvent } from '../../audit/events/audit-log-created.event'
-import { AuditLogUpdatedEvent } from '../../audit/events/audit-log-updated.event'
 
 @Injectable()
 export class NotificationService {
@@ -36,22 +32,19 @@ export class NotificationService {
 
   @OnEvent(SandboxEvents.CREATED)
   async handleSandboxCreated(event: SandboxCreatedEvent) {
-    const runner = await this.runnerService.findOne(event.sandbox.runnerId)
-    const dto = SandboxDto.fromSandbox(event.sandbox, runner.domain)
+    const dto = SandboxDto.fromSandbox(event.sandbox)
     this.notificationGateway.emitSandboxCreated(dto)
   }
 
   @OnEvent(SandboxEvents.STATE_UPDATED)
   async handleSandboxStateUpdated(event: SandboxStateUpdatedEvent) {
-    const runner = await this.runnerService.findOne(event.sandbox.runnerId)
-    const dto = SandboxDto.fromSandbox(event.sandbox, runner.domain)
+    const dto = SandboxDto.fromSandbox(event.sandbox)
     this.notificationGateway.emitSandboxStateUpdated(dto, event.oldState, event.newState)
   }
 
   @OnEvent(SandboxEvents.DESIRED_STATE_UPDATED)
   async handleSandboxDesiredStateUpdated(event: SandboxDesiredStateUpdatedEvent) {
-    const runner = await this.runnerService.findOne(event.sandbox.runnerId)
-    const dto = SandboxDto.fromSandbox(event.sandbox, runner.domain)
+    const dto = SandboxDto.fromSandbox(event.sandbox)
     this.notificationGateway.emitSandboxDesiredStateUpdated(dto, event.oldDesiredState, event.newDesiredState)
   }
 
@@ -89,17 +82,5 @@ export class NotificationService {
   async handleVolumeLastUsedAtUpdated(event: VolumeLastUsedAtUpdatedEvent) {
     const dto = VolumeDto.fromVolume(event.volume)
     this.notificationGateway.emitVolumeLastUsedAtUpdated(dto)
-  }
-
-  @OnEvent(AuditLogEvents.CREATED)
-  async handleAuditLogCreated(event: AuditLogCreatedEvent) {
-    const dto = AuditLogDto.fromAuditLog(event.auditLog)
-    this.notificationGateway.emitAuditLogCreated(dto)
-  }
-
-  @OnEvent(AuditLogEvents.UPDATED)
-  async handleAuditLogUpdated(event: AuditLogUpdatedEvent) {
-    const dto = AuditLogDto.fromAuditLog(event.auditLog)
-    this.notificationGateway.emitAuditLogUpdated(dto)
   }
 }

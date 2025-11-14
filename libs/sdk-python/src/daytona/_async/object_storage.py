@@ -6,12 +6,14 @@ import hashlib
 import os
 import tarfile
 import threading
+from typing import Optional
 
 import aiofiles
 import aiofiles.os
 from obstore.store import S3Store
 
 from .._utils.docs_ignore import docs_ignore
+from .._utils.environment import isolated_env
 
 
 class AsyncObjectStorage:
@@ -34,15 +36,16 @@ class AsyncObjectStorage:
         bucket_name: str = "daytona-volume-builds",
     ):
         self.bucket_name = bucket_name
-        self.store = S3Store(
-            bucket=bucket_name,
-            endpoint=endpoint_url,
-            access_key_id=aws_access_key_id,
-            secret_access_key=aws_secret_access_key,
-            token=aws_session_token,
-        )
+        with isolated_env():
+            self.store = S3Store(
+                bucket=bucket_name,
+                endpoint=endpoint_url,
+                access_key_id=aws_access_key_id,
+                secret_access_key=aws_secret_access_key,
+                token=aws_session_token,
+            )
 
-    async def upload(self, path: str, organization_id: str, archive_base_path: str | None = None) -> str:
+    async def upload(self, path: str, organization_id: str, archive_base_path: Optional[str] = None) -> str:
         """Uploads a file to the object storage service.
 
         Args:
@@ -86,7 +89,7 @@ class AsyncObjectStorage:
         # Remove leading separators (both / and \)
         return path_without_drive.lstrip("/").lstrip("\\")
 
-    async def _compute_hash_for_path_md5(self, path_str: str, archive_base_path: str | None = None) -> str:
+    async def _compute_hash_for_path_md5(self, path_str: str, archive_base_path: Optional[str] = None) -> str:
         """Computes the MD5 hash for a given path.
 
         Args:
@@ -142,7 +145,7 @@ class AsyncObjectStorage:
             return False
         return True
 
-    async def _upload_as_tar(self, s3_key: str, source_path: str, archive_base_path: str | None = None) -> None:
+    async def _upload_as_tar(self, s3_key: str, source_path: str, archive_base_path: Optional[str] = None) -> None:
         """Uploads a file to the object storage service as a tar.
 
         Args:

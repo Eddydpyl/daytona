@@ -28,7 +28,6 @@ import { SandboxState } from '../../sandbox/enums/sandbox-state.enum'
 import { EventEmitter2 } from '@nestjs/event-emitter'
 import { OrganizationEvents } from '../constants/organization-events.constant'
 import { CreateOrganizationQuotaDto } from '../dto/create-organization-quota.dto'
-import { DEFAULT_ORGANIZATION_QUOTA } from '../../common/constants/default-organization-quota'
 import { UserEmailVerifiedEvent } from '../../user/events/user-email-verified.event'
 import { Cron, CronExpression } from '@nestjs/schedule'
 import { RedisLockProvider } from '../../sandbox/common/redis-lock.provider'
@@ -42,11 +41,14 @@ import { TrackableJobExecutions } from '../../common/interfaces/trackable-job-ex
 import { setTimeout } from 'timers/promises'
 import { TypedConfigService } from '../../config/typed-config.service'
 import { LogExecution } from '../../common/decorators/log-execution.decorator'
+import { WithInstrumentation } from '../../common/decorators/otel.decorator'
 
 @Injectable()
 export class OrganizationService implements OnModuleInit, TrackableJobExecutions, OnApplicationShutdown {
   activeJobs = new Set<string>()
   private readonly logger = new Logger(OrganizationService.name)
+  private defaultOrganizationQuota: CreateOrganizationQuotaDto
+  private defaultSandboxLimitedNetworkEgress: boolean
 
   constructor(
     @InjectRepository(Organization)
@@ -58,7 +60,12 @@ export class OrganizationService implements OnModuleInit, TrackableJobExecutions
     private readonly eventEmitter: EventEmitter2,
     private readonly configService: TypedConfigService,
     private readonly redisLockProvider: RedisLockProvider,
-  ) {}
+  ) {
+    this.defaultOrganizationQuota = this.configService.getOrThrow('defaultOrganizationQuota')
+    this.defaultSandboxLimitedNetworkEgress = this.configService.getOrThrow(
+      'organizationSandboxDefaultLimitedNetworkEgress',
+    )
+  }
 
   async onApplicationShutdown() {
     //  wait for all active jobs to finish
@@ -206,7 +213,8 @@ export class OrganizationService implements OnModuleInit, TrackableJobExecutions
     createdBy: string,
     creatorEmailVerified: boolean,
     personal = false,
-    quota: CreateOrganizationQuotaDto = DEFAULT_ORGANIZATION_QUOTA,
+    quota: CreateOrganizationQuotaDto = this.defaultOrganizationQuota,
+    sandboxLimitedNetworkEgress: boolean = this.defaultSandboxLimitedNetworkEgress,
   ): Promise<Organization> {
     if (personal) {
       const count = await entityManager.count(Organization, {
@@ -225,7 +233,9 @@ export class OrganizationService implements OnModuleInit, TrackableJobExecutions
       throw new ForbiddenException('You have reached the maximum number of created organizations')
     }
 
-    let organization = new Organization()
+    const defaultRegion = this.configService.getOrThrow('defaultRegion')
+
+    let organization = new Organization(defaultRegion)
 
     organization.name = createOrganizationDto.name
     organization.createdBy = createdBy
@@ -241,7 +251,7 @@ export class OrganizationService implements OnModuleInit, TrackableJobExecutions
     organization.maxSnapshotSize = quota.maxSnapshotSize
     organization.volumeQuota = quota.volumeQuota
 
-    if (!creatorEmailVerified) {
+    if (!creatorEmailVerified && !this.configService.get('skipUserEmailVerification')) {
       organization.suspended = true
       organization.suspendedAt = new Date()
       organization.suspensionReason = 'Please verify your email address'
@@ -251,7 +261,7 @@ export class OrganizationService implements OnModuleInit, TrackableJobExecutions
       organization.suspensionReason = 'Payment method required'
     }
 
-    organization.sandboxLimitedNetworkEgress = this.configService.get('organizationSandboxDefaultLimitedNetworkEgress')
+    organization.sandboxLimitedNetworkEgress = sandboxLimitedNetworkEgress
 
     const owner = new OrganizationUser()
     owner.userId = createdBy
@@ -305,6 +315,7 @@ export class OrganizationService implements OnModuleInit, TrackableJobExecutions
   @Cron(CronExpression.EVERY_MINUTE, { name: 'stop-suspended-organization-sandboxes' })
   @TrackJobExecution()
   @LogExecution('stop-suspended-organization-sandboxes')
+  @WithInstrumentation()
   async stopSuspendedOrganizationSandboxes(): Promise<void> {
     //  lock the sync to only run one instance at a time
     const lockKey = 'stop-suspended-organization-sandboxes'
@@ -358,6 +369,7 @@ export class OrganizationService implements OnModuleInit, TrackableJobExecutions
   @Cron(CronExpression.EVERY_MINUTE, { name: 'deactivate-suspended-organization-snapshots' })
   @TrackJobExecution()
   @LogExecution('deactivate-suspended-organization-snapshots')
+  @WithInstrumentation()
   async deactivateSuspendedOrganizationSnapshots(): Promise<void> {
     //  lock the sync to only run one instance at a time
     const lockKey = 'deactivate-suspended-organization-snapshots'
@@ -425,6 +437,7 @@ export class OrganizationService implements OnModuleInit, TrackableJobExecutions
       payload.user.role === SystemRole.ADMIN ? true : payload.user.emailVerified,
       true,
       payload.personalOrganizationQuota,
+      payload.user.role === SystemRole.ADMIN ? false : undefined,
     )
   }
 

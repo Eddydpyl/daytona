@@ -12,16 +12,34 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/daytonaio/daemon/internal/util"
 	"github.com/daytonaio/daemon/pkg/common"
 	"github.com/gin-gonic/gin"
+	"github.com/shirou/gopsutil/v4/process"
 
 	log "github.com/sirupsen/logrus"
 )
 
+const TERMINATION_GRACE_PERIOD = 5 * time.Second
+const TERMINATION_CHECK_INTERVAL = 100 * time.Millisecond
+
 var sessions = map[string]*session{}
 
+// CreateSession godoc
+//
+//	@Summary		Create a new session
+//	@Description	Create a new shell session for command execution
+//	@Tags			process
+//	@Accept			json
+//	@Produce		json
+//	@Param			request	body	CreateSessionRequest	true	"Session creation request"
+//	@Success		201
+//	@Router			/process/session [post]
+//
+//	@id				CreateSession
 func (s *SessionController) CreateSession(c *gin.Context) {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -92,27 +110,56 @@ func (s *SessionController) CreateSession(c *gin.Context) {
 	c.Status(http.StatusCreated)
 }
 
+// DeleteSession godoc
+//
+//	@Summary		Delete a session
+//	@Description	Delete an existing shell session
+//	@Tags			process
+//	@Param			sessionId	path	string	true	"Session ID"
+//	@Success		204
+//	@Router			/process/session/{sessionId} [delete]
+//
+//	@id				DeleteSession
 func (s *SessionController) DeleteSession(c *gin.Context) {
 	sessionId := c.Param("sessionId")
 
 	session, ok := sessions[sessionId]
 	if !ok {
-		c.AbortWithError(http.StatusNotFound, errors.New("session not found"))
+		_ = c.AbortWithError(http.StatusNotFound, errors.New("session not found"))
 		return
 	}
 
+	// Terminate process group first with signals (SIGTERM -> SIGKILL)
+	err := s.terminateSession(c.Request.Context(), session)
+	if err != nil {
+		log.Errorf("Failed to terminate session %s: %v", session.id, err)
+		// Continue with cleanup even if termination fails
+	}
+
+	// Cancel context after termination
 	session.cancel()
 
-	err := os.RemoveAll(session.Dir(s.configDir))
+	// Clean up session directory
+	err = os.RemoveAll(session.Dir(s.configDir))
 	if err != nil {
 		c.AbortWithError(http.StatusBadRequest, err)
 		return
 	}
 
-	delete(sessions, sessionId)
+	delete(sessions, session.id)
 	c.Status(http.StatusNoContent)
 }
 
+// ListSessions godoc
+//
+//	@Summary		List all sessions
+//	@Description	Get a list of all active shell sessions
+//	@Tags			process
+//	@Produce		json
+//	@Success		200	{array}	Session
+//	@Router			/process/session [get]
+//
+//	@id				ListSessions
 func (s *SessionController) ListSessions(c *gin.Context) {
 	sessionDTOs := []Session{}
 
@@ -132,6 +179,17 @@ func (s *SessionController) ListSessions(c *gin.Context) {
 	c.JSON(http.StatusOK, sessionDTOs)
 }
 
+// GetSession godoc
+//
+//	@Summary		Get session details
+//	@Description	Get details of a specific session including its commands
+//	@Tags			process
+//	@Produce		json
+//	@Param			sessionId	path		string	true	"Session ID"
+//	@Success		200			{object}	Session
+//	@Router			/process/session/{sessionId} [get]
+//
+//	@id				GetSession
 func (s *SessionController) GetSession(c *gin.Context) {
 	sessionId := c.Param("sessionId")
 
@@ -153,6 +211,18 @@ func (s *SessionController) GetSession(c *gin.Context) {
 	})
 }
 
+// GetSessionCommand godoc
+//
+//	@Summary		Get session command details
+//	@Description	Get details of a specific command within a session
+//	@Tags			process
+//	@Produce		json
+//	@Param			sessionId	path		string	true	"Session ID"
+//	@Param			commandId	path		string	true	"Command ID"
+//	@Success		200			{object}	Command
+//	@Router			/process/session/{sessionId}/command/{commandId} [get]
+//
+//	@id				GetSessionCommand
 func (s *SessionController) GetSessionCommand(c *gin.Context) {
 	sessionId := c.Param("sessionId")
 	cmdId := c.Param("commandId")
@@ -216,4 +286,87 @@ func (s *SessionController) getSessionCommand(sessionId, cmdId string) (*Command
 	command.ExitCode = &exitCodeInt
 
 	return command, nil
+}
+
+func (s *SessionController) terminateSession(ctx context.Context, session *session) error {
+	if session.cmd == nil || session.cmd.Process == nil {
+		return nil
+	}
+
+	pid := session.cmd.Process.Pid
+
+	_ = s.signalProcessTree(pid, syscall.SIGTERM)
+
+	err := session.cmd.Process.Signal(syscall.SIGTERM)
+	if err != nil {
+		// If SIGTERM fails, try SIGKILL immediately
+		log.Warnf("SIGTERM failed for session %s, trying SIGKILL: %v", session.id, err)
+		_ = s.signalProcessTree(pid, syscall.SIGKILL)
+		return session.cmd.Process.Kill()
+	}
+
+	// Wait for graceful termination
+	if s.waitForTermination(ctx, pid, TERMINATION_GRACE_PERIOD, TERMINATION_CHECK_INTERVAL) {
+		log.Debugf("Session %s terminated gracefully", session.id)
+		return nil
+	}
+
+	log.Debugf("Session %s timeout, sending SIGKILL to process tree", session.id)
+	_ = s.signalProcessTree(pid, syscall.SIGKILL)
+	return session.cmd.Process.Kill()
+}
+
+func (s *SessionController) signalProcessTree(pid int, sig syscall.Signal) error {
+	parent, err := process.NewProcess(int32(pid))
+	if err != nil {
+		return err
+	}
+
+	descendants, err := parent.Children()
+	if err != nil {
+		return err
+	}
+
+	for _, child := range descendants {
+		childPid := int(child.Pid)
+		_ = s.signalProcessTree(childPid, sig)
+	}
+
+	for _, child := range descendants {
+		// Convert to OS process to send custom signal
+		if childProc, err := os.FindProcess(int(child.Pid)); err == nil {
+			_ = childProc.Signal(sig)
+		}
+	}
+
+	return nil
+}
+
+func (s *SessionController) waitForTermination(ctx context.Context, pid int, timeout, interval time.Duration) bool {
+	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-timeoutCtx.Done():
+			return false
+		case <-ticker.C:
+			parent, err := process.NewProcess(int32(pid))
+			if err != nil {
+				// Process doesn't exist anymore
+				return true
+			}
+			children, err := parent.Children()
+			if err != nil {
+				// Unable to enumerate children - likely process is dying/dead
+				return true
+			}
+			if len(children) == 0 {
+				return true
+			}
+		}
+	}
 }
